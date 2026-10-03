@@ -1,0 +1,289 @@
+"""Synthetic source databases only. No account or network access."""
+import importlib.util
+from pathlib import Path
+import sqlite3
+import tempfile
+import unittest
+
+SOURCE_PATH = Path(__file__).resolve().parents[1] / 'sources.py'
+Source = None
+if SOURCE_PATH.exists():
+    spec = importlib.util.spec_from_file_location('memory_sources', SOURCE_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    Source = module.Source
+
+
+class SourceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+
+    def source(self, kind):
+        self.assertIsNotNone(Source, 'Source adapter has not been implemented')
+        path = Path(self.temp.name) / (kind + '.db')
+        c = sqlite3.connect(path)
+        if kind == 'whatsapp':
+            c.executescript('''
+                CREATE TABLE chats(jid TEXT PRIMARY KEY,name TEXT,last_message_time TEXT);
+                CREATE TABLE messages(id TEXT,chat_jid TEXT,sender TEXT,content TEXT,
+                    timestamp TEXT,is_from_me BOOLEAN,media_type TEXT,filename TEXT,
+                    PRIMARY KEY(id,chat_jid));
+                CREATE TABLE transcripts(message_id TEXT,chat_jid TEXT,text TEXT,
+                    status TEXT,attempts INTEGER DEFAULT 0,updated_at TEXT,
+                    PRIMARY KEY(message_id,chat_jid));
+                INSERT INTO chats VALUES('a','Alpha',NULL),('b','Beta',NULL);
+            ''')
+        else:
+            c.executescript('''
+                CREATE TABLE chats(id INTEGER PRIMARY KEY,title TEXT,
+                    first_pass_done INTEGER DEFAULT 0,backfill_done INTEGER DEFAULT 0);
+                CREATE TABLE messages(chat_id INTEGER,id INTEGER,date TEXT,sender_id INTEGER,
+                    sender_name TEXT,out INTEGER DEFAULT 0,text TEXT,media_type TEXT,
+                    deleted INTEGER DEFAULT 0,edited INTEGER DEFAULT 0,
+                    PRIMARY KEY(chat_id,id));
+                CREATE TABLE transcripts(chat_id INTEGER,id INTEGER,text TEXT,status TEXT,
+                    attempts INTEGER DEFAULT 0,updated_at TEXT,PRIMARY KEY(chat_id,id));
+                INSERT INTO chats(id,title) VALUES(1,'Alpha'),(2,'Beta');
+            ''')
+        c.close()
+        return Source(kind, path)
+
+    def write(self, source, sql, args=()):
+        with sqlite3.connect(source.path) as c:
+            c.execute(sql, args)
+
+    def insert(self, source, chat=None, mid=None, text='synthetic text', media=''):
+        if source.kind == 'whatsapp':
+            self.write(source, '''INSERT OR REPLACE INTO messages
+                (chat_jid,id,sender,content,timestamp,is_from_me,media_type)
+                VALUES(?,?,'sender',?,'2026-09-14 09:00:00-06:00',0,?)''',
+                (chat or 'a', mid or 'same', text, media))
+        else:
+            self.write(source, '''INSERT OR REPLACE INTO messages
+                (chat_id,id,sender_id,sender_name,text,date,media_type)
+                VALUES(?,?,123,'Sender',?,'2026-09-14T15:00:00Z',?)''',
+                (chat or 1, mid or 10, text, media))
+
+    def test_backfill_pages_and_normalizes_composite_identity(self):
+        for kind in ['whatsapp', 'telegram']:
+            with self.subTest(kind=kind):
+                source = self.source(kind)
+                self.insert(source)
+                self.insert(source, chat='b' if kind == 'whatsapp' else 2, text='')
+                source.install_capture()
+                first = source.backfill_page(0, 1)
+                second = source.backfill_page(first[-1]['rowid'], 1)
+                self.assertEqual(len(first), 1)
+                self.assertEqual(len(second), 1)
+                self.assertEqual(first[0]['timestamp'], 1789398000)
+                self.assertEqual(first[0]['source'], kind)
+                self.assertEqual(first[0]['chat_name'], 'Alpha')
+                self.assertIsInstance(first[0]['chat_id'], str)
+                self.assertIsInstance(first[0]['message_id'], str)
+                self.assertNotEqual(first[0]['chat_id'], second[0]['chat_id'])
+                self.assertEqual(first[0]['message_id'], second[0]['message_id'])
+                self.assertEqual(second[0]['text'], '')
+                self.assertEqual(source.backfill_page(second[-1]['rowid'], 1), [])
+                self.assertEqual(source.watermark(), 0)
+
+    def test_capture_is_transactional_and_idempotent(self):
+        source = self.source('whatsapp')
+        source.install_capture()
+        source.install_capture()
+        self.insert(source)
+        with sqlite3.connect(source.path) as c:
+            c.execute("UPDATE messages SET content='rolled back'")
+            c.rollback()
+        changes = source.changes(0, 20)
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]['op'], 'upsert')
+        self.assertNotIn('text', changes[0])
+        self.assertEqual(source.get('a', 'same')['text'], 'synthetic text')
+
+    def test_whatsapp_replace_edit_delete_and_reinsert(self):
+        source = self.source('whatsapp')
+        source.install_capture()
+        self.insert(source)
+        old_rowid = source.get('a', 'same')['rowid']
+        self.insert(source, chat='b')
+        self.insert(source, text='replacement')
+        self.assertNotEqual(source.get('a', 'same')['rowid'], old_rowid)
+        self.write(source, "UPDATE messages SET content='edited' WHERE chat_jid='a'")
+        cursor = source.watermark()
+        self.write(source, "DELETE FROM messages WHERE chat_jid='a'")
+        self.assertIsNone(source.get('a', 'same'))
+        self.assertEqual(source.changes(cursor, 10)[0]['op'], 'delete')
+        self.insert(source, text='restored')
+        self.assertEqual(source.get('a', 'same')['text'], 'restored')
+        self.assertEqual(source.get('b', 'same')['text'], 'synthetic text')
+
+    def test_telegram_softdelete_is_a_tombstone_even_with_transcript(self):
+        source = self.source('telegram')
+        source.install_capture()
+        self.insert(source, media='voice')
+        self.write(source, "INSERT INTO transcripts(chat_id,id,text,status) VALUES(1,10,'voice','done')")
+        cursor = source.watermark()
+        self.write(source, 'UPDATE messages SET deleted=1 WHERE chat_id=1 AND id=10')
+        self.assertIsNone(source.get('1', '10'))
+        self.assertEqual(source.backfill_page(0, 20), [])
+        self.assertEqual(source.changes(cursor, 20)[0]['op'], 'delete')
+
+    def test_late_transcripts_are_canonical_and_captured_without_message_update(self):
+        for kind in ['whatsapp', 'telegram']:
+            with self.subTest(kind=kind):
+                source = self.source(kind)
+                source.install_capture()
+                self.insert(source, text='', media='audio' if kind == 'whatsapp' else 'voice')
+                key = ('a', 'same') if kind == 'whatsapp' else ('1', '10')
+                columns = 'chat_jid,message_id' if kind == 'whatsapp' else 'chat_id,id'
+                cursor = source.watermark()
+                self.write(source, f'INSERT INTO transcripts({columns},text,status) VALUES(?,?,?,?)',
+                           (*key, 'spoken synthetic text', 'done'))
+                self.assertEqual(source.get(*key)['text'], '[Nota de voz] spoken synthetic text')
+                self.assertEqual(source.changes(cursor, 10)[0]['op'], 'upsert')
+                self.write(source, "UPDATE transcripts SET text='corrected'")
+                self.assertEqual(source.get(*key)['text'], '[Nota de voz] corrected')
+                self.write(source, 'DELETE FROM transcripts')
+                self.assertEqual(source.get(*key)['text'], '')
+
+    def test_caption_wins_over_transcript_but_voice_prefix_is_repaired(self):
+        source = self.source('whatsapp')
+        source.install_capture()
+        self.insert(source, text='real caption', media='audio')
+        self.write(source, "INSERT INTO transcripts(chat_jid,message_id,text,status) VALUES('a','same','voice','done')")
+        self.assertEqual(source.get('a', 'same')['text'], 'real caption')
+        self.write(source, "UPDATE messages SET content='[Nota de voz] old'")
+        self.assertEqual(source.get('a', 'same')['text'], '[Nota de voz] voice')
+
+    def test_video_transcript_appends_to_caption(self):
+        source = self.source('whatsapp')
+        source.install_capture()
+        self.insert(source, mid='vid1', text='mira esto', media='video')
+        self.write(source, "INSERT INTO transcripts(chat_jid,message_id,text,status) VALUES('a','vid1','hola banda, este es el pitch','done')")
+        self.assertEqual(source.get('a', 'vid1')['text'], 'mira esto\n[Audio del video] hola banda, este es el pitch')
+        self.insert(source, mid='vid2', text='', media='video')
+        self.write(source, "INSERT INTO transcripts(chat_jid,message_id,text,status) VALUES('a','vid2','sin caption','done')")
+        self.assertEqual(source.get('a', 'vid2')['text'], '[Audio del video] sin caption')
+        self.insert(source, mid='vid4', text='[Audio del video] ya escrito por el bridge', media='video')
+        self.write(source, "INSERT INTO transcripts(chat_jid,message_id,text,status) VALUES('a','vid4','ya escrito por el bridge','done')")
+        self.assertEqual(source.get('a', 'vid4')['text'], '[Audio del video] ya escrito por el bridge')
+        self.insert(source, mid='vid5', text='edited caption\n[Audio del video] manual correction', media='video')
+        self.write(source, "INSERT INTO transcripts(chat_jid,message_id,text,status) VALUES('a','vid5','original machine transcript','done')")
+        self.assertEqual(source.get('a', 'vid5')['text'], 'edited caption\n[Audio del video] manual correction')
+        self.insert(source, mid='vid3', text='pendiente', media='video')
+        self.write(source, "INSERT INTO transcripts(chat_jid,message_id,text,status) VALUES('a','vid3',NULL,'failed')")
+        self.assertEqual(source.get('a', 'vid3')['text'], 'pendiente')
+
+    def test_resume_replays_all_changes_after_snapshot_watermark(self):
+        source = self.source('telegram')
+        self.insert(source)
+        source.install_capture()
+        watermark = source.watermark()
+        snapshot = source.backfill_page(0, 20)
+        self.insert(source, chat=2, text='other chat')
+        self.write(source, "UPDATE messages SET text='updated' WHERE chat_id=1")
+        self.write(source, 'DELETE FROM messages WHERE chat_id=2')
+        index = {(r['chat_id'], r['message_id']): r for r in snapshot}
+        resumed = Source('telegram', source.path)
+        while events := resumed.changes(watermark, 1):
+            event = events[0]
+            key = event['chat_id'], event['message_id']
+            row = resumed.get(*key)
+            if row is None:
+                index.pop(key, None)
+            else:
+                index[key] = row
+            watermark = event['seq']
+        self.assertEqual(list(index), [('1', '10')])
+        self.assertEqual(index[('1', '10')]['text'], 'updated')
+
+    def test_primary_key_update_captures_old_key_removal(self):
+        source = self.source('telegram')
+        source.install_capture()
+        self.insert(source)
+        cursor = source.watermark()
+        self.write(source, 'UPDATE messages SET chat_id=2 WHERE chat_id=1')
+        events = source.changes(cursor, 20)
+        self.assertEqual([(r['chat_id'], r['op']) for r in events], [('1', 'delete'), ('2', 'upsert')])
+
+    def test_stats_have_aggregate_counts_and_no_bodies(self):
+        source = self.source('telegram')
+        source.install_capture()
+        self.insert(source, text='private synthetic sentinel')
+        self.insert(source, chat=2, text='deleted sentinel')
+        self.write(source, 'UPDATE messages SET deleted=1 WHERE chat_id=2')
+        stats = source.stats()
+        self.assertEqual(stats['messages'], 2)
+        self.assertEqual(stats['deleted_messages'], 1)
+        self.assertEqual(stats['text_messages'], 1)
+        self.assertEqual(stats['chats'], 2)
+        self.assertEqual(stats['first_timestamp'], 1789398000)
+        self.assertNotIn('sentinel', str(stats))
+
+    def test_absent_transcripts_are_supported_without_creating_source_tables(self):
+        source = self.source('whatsapp')
+        self.write(source, 'DROP TABLE transcripts')
+        self.insert(source)
+        source.install_capture()
+        self.assertEqual(source.get('a', 'same')['text'], 'synthetic text')
+        with sqlite3.connect(source.path) as c:
+            self.assertIsNone(c.execute("SELECT name FROM sqlite_master WHERE name='transcripts'").fetchone())
+
+    def test_capture_ignores_noop_updates(self):
+        source = self.source('telegram')
+        source.install_capture()
+        self.insert(source)
+        watermark = source.watermark()
+        self.write(source, 'UPDATE messages SET text=text')
+        self.assertEqual(source.watermark(), watermark)
+
+    def test_missing_source_is_never_created(self):
+        self.assertIsNotNone(Source, 'Source adapter has not been implemented')
+        path = Path(self.temp.name) / 'missing.db'
+        source = Source('whatsapp', path)
+        with self.assertRaises(sqlite3.OperationalError):
+            source.install_capture()
+        self.assertFalse(path.exists())
+
+    def test_capture_identity_and_event_tokens_survive_reinstallation(self):
+        source = self.source('telegram')
+        source.install_capture()
+        self.assertTrue(callable(getattr(source, 'identity', None)), 'capture identity is missing')
+        identity = source.identity()
+        self.assertTrue(identity)
+        self.insert(source)
+        self.insert(source, chat=2)
+        events = source.changes(0, 20)
+        self.assertTrue(all(len(event['event_token']) == 32 for event in events))
+        self.assertNotEqual(events[0]['event_token'], events[1]['event_token'])
+        source.install_capture()
+        resumed = Source('telegram', source.path)
+        self.assertEqual(resumed.identity(), identity)
+        self.assertEqual(resumed.changes(0, 20), events)
+        self.assertEqual(resumed.checkpoint_token(events[-1]['seq']), events[-1]['event_token'])
+        self.assertIsNone(resumed.checkpoint_token(0))
+        self.assertIsNone(resumed.checkpoint_token(events[-1]['seq'] + 1))
+
+    def test_legacy_queue_tokens_are_migrated_without_rewriting_events(self):
+        source = self.source('whatsapp')
+        self.write(source, '''CREATE TABLE memory_changes(seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT NOT NULL,message_id TEXT NOT NULL,op TEXT NOT NULL)''')
+        self.write(source, "INSERT INTO memory_changes VALUES(7,'a','legacy','upsert')")
+        source.install_capture()
+        legacy = source.changes(0, 20)[0]
+        self.assertIn('event_token', legacy, 'legacy queue token migration is missing')
+        self.assertEqual((legacy['seq'], legacy['chat_id'], legacy['message_id'], legacy['op']),
+                         (7, 'a', 'legacy', 'upsert'))
+        self.assertEqual(len(legacy['event_token']), 32)
+        self.insert(source)
+        new = source.changes(7, 20)[0]
+        self.assertEqual(len(new['event_token']), 32)
+        self.assertNotEqual(new['event_token'], legacy['event_token'])
+        source.install_capture()
+        self.assertEqual(source.checkpoint_token(7), legacy['event_token'])
+        self.assertEqual(source.get('a', 'same')['text'], 'synthetic text')
+
+
+if __name__ == '__main__':
+    unittest.main()

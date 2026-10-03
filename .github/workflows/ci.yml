@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md', 'docs/**', 'LICENSE']
+  pull_request:
+    paths-ignore: ['**.md', 'docs/**', 'LICENSE']
+  schedule:
+    - cron: '17 6 * * 1'  # weekly whatsmeow upgrade probe
+
+# Supersede in-flight runs when a branch gets a newer push; never cancel main.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: go mod download
+      - name: gofmt
+        run: |
+          diff=$(gofmt -l .)
+          if [ -n "$diff" ]; then
+            echo "gofmt differences:"
+            echo "$diff"
+            gofmt -d .
+            exit 1
+          fi
+      - run: go vet ./...
+      - run: go test -race -coverprofile=cover.out ./...
+      - run: go tool cover -func=cover.out | tail -1
+      - run: go build ./...
+      - name: mdtest parity grep
+        # Fails if a whatsmeow method we call disappears upstream — an early
+        # signal that the API was removed or renamed.
+        run: bash ./scripts/mdtest-parity.sh
+
+  upgrade-check:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Record pinned version
+        run: echo "OLD_PIN=$(go list -m -f '{{.Version}}' go.mau.fi/whatsmeow)" >> "$GITHUB_ENV"
+      - run: go get go.mau.fi/whatsmeow@main
+      - run: go mod tidy
+      - name: Record upstream version
+        run: echo "NEW_PIN=$(go list -m -f '{{.Version}}' go.mau.fi/whatsmeow)" >> "$GITHUB_ENV"
+      - run: go build ./...
+      - run: go test ./...
+      - name: Record build/test status
+        if: always()
+        run: echo "STATUS=${{ job.status }}" >> "$GITHUB_ENV"
+      - name: Report bump to rolling issue
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -z "${OLD_PIN:-}" ] || [ -z "${NEW_PIN:-}" ]; then
+            echo "version check did not complete; skipping report"
+            exit 0
+          fi
+          if [ "$OLD_PIN" = "$NEW_PIN" ]; then
+            echo "whatsmeow already current, nothing to report"
+            exit 0
+          fi
+          body="whatsmeow can be bumped.
+
+          - Current pin: \`$OLD_PIN\`
+          - Upstream @main: \`$NEW_PIN\`
+          - Build and test against @main: $STATUS
+
+          Run \`go get go.mau.fi/whatsmeow@main && go mod tidy\` to accept."
+          num=$(gh issue list --label upstream --state open --limit 1 --json number -q '.[0].number')
+          if [ -n "$num" ]; then
+            gh issue edit "$num" --body "$body"
+          else
+            gh issue create --title "whatsmeow upstream update available" --label upstream --body "$body"
+          fi

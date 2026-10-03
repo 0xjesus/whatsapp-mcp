@@ -1,0 +1,28 @@
+*.db
+claude_desktop_config.json
+whatsapp.log
+bin/
+cover.out
+# Anchored: only the repo-root session/data dir, NOT internal/store/
+/store/
+
+# Runtime secrets and generated state must never enter the public source tree.
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+credentials.json
+database.json
+embeddings.json
+runtime.json
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+*.sqlite3-wal
+*.sqlite3-shm
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/

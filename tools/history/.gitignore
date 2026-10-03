@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+*.db
+*.db-*
+*.dump
+*.key
+database.json
+reader.json
+runtime.json
+embeddings.json

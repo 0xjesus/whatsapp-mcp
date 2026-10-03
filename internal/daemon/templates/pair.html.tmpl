@@ -1,0 +1,13 @@
+<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="5">
+<title>Pair WhatsApp</title>
+<style>body{font-family:system-ui,sans-serif;max-width:32rem;margin:4rem auto;padding:0 1rem}</style>
+</head><body>
+<h1>Pair WhatsApp</h1>
+<p>Open WhatsApp on your phone &rarr; <em>Settings</em> &rarr; <em>Linked Devices</em> &rarr; <em>Link a Device</em>, then scan:</p>
+{{if .HasQR}}<p><img src="/pair/qr.png" alt="WhatsApp pairing QR"></p>
+<p><small>This page auto-refreshes every 5 seconds while the QR rotates.</small></p>{{else}}
+<p style="padding:2rem;border:1px dashed #999;text-align:center">Generating a fresh QR code&hellip;<br><small>Keep this tab open; it refreshes itself every 5 seconds.</small></p>{{end}}
+</body></html>
