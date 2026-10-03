@@ -121,7 +121,7 @@ def embedding_cycle(store, model, max_batches=4, step=None):
 
 
 def refresh_source_stats(store,source,refresh):
-    if time.monotonic()-refresh.get(source.kind,0)<=300:
+    if source.kind in refresh and time.monotonic()-refresh[source.kind]<=300:
         return
     # Aggregate metadata is optional. A slow source must not stall its change stream.
     refresh[source.kind]=time.monotonic()

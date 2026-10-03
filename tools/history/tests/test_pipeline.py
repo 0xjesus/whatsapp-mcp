@@ -75,7 +75,8 @@ class PipelineTests(unittest.TestCase):
         store.save_embeddings.assert_not_called()
         store.embedding_failed.assert_called_once()
 
-    def test_source_statistics_failure_never_blocks_message_ingestion(self):
+    @patch("worker.time.monotonic", return_value=10.0)
+    def test_source_statistics_failure_never_blocks_message_ingestion(self, _clock):
         from worker import refresh_source_stats
         source=Mock(kind='telegram')
         source.stats.side_effect=TimeoutError('synthetic slow aggregate')
