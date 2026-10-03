@@ -42,6 +42,9 @@ def semantic_statement(where, values, literal, limit):
             FROM filtered_chunks f JOIN scored_hashes h ON h.hash=f.hash
             UNION ALL
             '''
+    # Bound ANN overfetch to the requested result budget. Requiring 100 matching
+    # hashes even for six results made source-filtered HNSW walks exceed 45 s
+    # on a growing, disk-backed index; 20 retained the same top results in <1 s.
     sql = 'WITH ' + prefix + '''nearest AS MATERIALIZED (
         SELECT e.hash,e.embedding <=> %s::halfvec AS distance FROM embeddings e
         WHERE e.embedding IS NOT NULL''' + guard + ''' AND EXISTS(
@@ -65,4 +68,4 @@ def semantic_statement(where, values, literal, limit):
             left(m.text,4000) AS text,m.media_type,e.text AS matched_fragment,1-r.distance AS score
         FROM ranked r JOIN messages m ON m.id=r.id JOIN embeddings e ON e.hash=r.hash
         ORDER BY r.distance,r.timestamp DESC,r.id DESC'''
-    return sql, params + [literal] + values + [literal,min(1000,max(100,limit*10))] + values + [limit,limit]
+    return sql, params + [literal] + values + [literal,min(60,max(20,limit*2))] + values + [limit,limit]

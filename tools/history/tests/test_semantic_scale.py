@@ -6,6 +6,13 @@ import uuid
 
 
 class SemanticStatementTests(unittest.TestCase):
+    def test_small_search_does_not_force_hundred_filtered_hashes(self):
+        from perf_query import semantic_statement
+        sql, params = semantic_statement('m.source=%s', ['whatsapp'], '[1,0]', 6)
+        self.assertGreaterEqual(params[3], 6)
+        self.assertLessEqual(params[3], 20, 'small interactive searches must not traverse 100 matching hashes')
+        self.assertLess(sql.index('m.source=%s'), sql.index('ORDER BY e.embedding <=>'))
+
     def test_query_builder_exists(self):
         self.assertIsNotNone(importlib.util.find_spec('perf_query'), 'bounded semantic query is missing')
 
