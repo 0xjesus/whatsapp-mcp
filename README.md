@@ -1,207 +1,171 @@
-# WhatsApp MCP Server (0xjesus fork)
+# WhatsApp MCP: conversaciones consultables desde tu asistente
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Go 1.25+](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
 [![MCP](https://img.shields.io/badge/MCP-protocol-6366f1)](https://modelcontextprotocol.io/)
 [![whatsmeow](https://img.shields.io/badge/whatsmeow-multidevice-25D366?logo=whatsapp&logoColor=white)](https://github.com/tulir/whatsmeow)
 
-A single-binary Go [MCP](https://modelcontextprotocol.io/) server that wraps [whatsmeow](https://github.com/tulir/whatsmeow) to expose a personal WhatsApp account to LLM agents. `whatsapp-mcp serve` runs as a loopback HTTP daemon; MCP clients (Claude Code, Claude Desktop, Cursor, …) connect to it over HTTP. Messages are cached in local SQLite. Tool calls may send selected content to the agent’s model. The optional history worker also sends indexed text to the configured embedding provider in the background; choose a local provider to keep that step on your own machine.
+Conecta tu WhatsApp con un asistente de IA para consultar conversaciones, buscar acuerdos y trabajar con mensajes y archivos. Usa MCP, el protocolo que permite al asistente llamar herramientas de otras aplicaciones.
 
-This is a fork of [Sealjay/mcp-whatsapp](https://github.com/Sealjay/mcp-whatsapp) (itself a Go rewrite of [lharries/whatsapp-mcp](https://github.com/lharries/whatsapp-mcp)). All credit for the base server goes to those projects; this fork exists because we run the daemon 24/7 on an always-on Linux box as the WhatsApp memory of a personal assistant, and that use case needed a few things upstream does not have yet (see [What this fork adds](#what-this-fork-adds)).
+Este fork añade búsqueda por significado, transcripción de audios y videos, y un historial que incorpora reacciones, ediciones y eliminaciones recibidas. La búsqueda semántica y la transcripción necesitan los servicios opcionales incluidos en el repositorio.
 
-> **Unaffiliated.** Independent open-source project. Not affiliated with, endorsed by, or associated with Meta Platforms, Inc., WhatsApp, or whatsmeow. "WhatsApp" is a trademark of Meta Platforms, Inc., used nominatively to describe interoperability.
+Parte de [Sealjay/mcp-whatsapp](https://github.com/Sealjay/mcp-whatsapp), basado a su vez en [lharries/whatsapp-mcp](https://github.com/lharries/whatsapp-mcp). La conexión con WhatsApp utiliza [whatsmeow](https://github.com/tulir/whatsmeow). El crédito por el servidor base corresponde a esos proyectos.
 
-> **Keep runtime data private.** Session state (`store/whatsapp.db`), the message cache (`store/messages.db`), downloaded media and any token are created at runtime under `store/` (git-ignored) or passed through environment variables. Test fixtures use synthetic `4477009…` numbers and invented names. If you deploy this, keep your `store/` directory private: it holds your WhatsApp session keys and your message history.
+## Lo que añade este fork
 
-## What this fork adds
+<a id="what-this-fork-adds"></a>
 
-Everything below is additive: an upstream build still opens the same SQLite files (new tables are created with `IF NOT EXISTS`).
+- **Buscar por lo que recuerdas.** Encuentra conversaciones por su significado, aunque no recuerdes las palabras exactas. Combina búsqueda semántica y búsqueda de texto.
+- **Buscar dentro de notas de voz.** Transcribe los audios disponibles para que puedas consultar lo que se dijo. La transcripción se ejecuta localmente.
+- **Revisar videos desde el asistente.** Transcribe su audio y entrega hasta seis fotogramas para inspeccionar el contenido visual. Los fotogramas son una muestra del clip.
+- **Recordar reacciones recibidas.** Guarda quién reaccionó a un mensaje y refleja si cambió o quitó el emoji.
+- **Mantener el historial actualizado.** Incorpora ediciones y eliminaciones recibidas. Evita que una sincronización antigua vuelva a introducir mensajes revocados.
+- **Registrar más tipos de contenido.** Guarda stickers, ubicaciones y contactos. Si llega un tipo todavía no compatible, deja un aviso en el historial.
+- **Solicitar más historial antiguo.** Al vincular la cuenta, puede pedir una ventana histórica mayor. La recuperación depende de lo que WhatsApp entregue.
+- **Aplicar controles adicionales de envío.** Espacia mensajes, aplica límites y frena acciones cuando detecta restricciones de la cuenta. Estos controles no garantizan evitar bloqueos.
+- **Mostrar cuánto falta por procesar.** Permite consultar la cobertura del índice, los mensajes pendientes de preparar para búsquedas y estadísticas del historial disponible.
 
-| Area | What changed | Where |
-|---|---|---|
-| **Full history sync** | Pairing requests the full history window (`WHATSAPP_MCP_FULL_SYNC=1`, 5000 days / 10 GB) so a fresh install gets as much past as WhatsApp will serve. | `internal/client/client.go` |
-| **Account health and send limits** | A health state machine (`ok` / `restricted` / `temp_banned` / `logged_out` / `client_outdated`), send budgets for message actions, typing delays for text, and on-demand pairing with QR re-issue. Reconnection preserves active restrictions. These controls cannot guarantee account safety. `get_status` reports `health`. | `internal/client/safety.go`, `internal/daemon/` |
-| **Edits and revocations** | Incoming edits update the cached message (original timestamp kept); revocations delete it and leave a tombstone so a later history batch cannot resurrect it. | `internal/client/mutations.go`, `docs/memory.md` |
-| **Reactions** | Live `ReactionMessage`s and history-sync reactions are stored with timestamp ordering and removal tombstones (latest emoji per reactor per message) and mirrored as `media_type = "reaction"` rows so external indexers see them. `list_messages` prints `↳ 👍 Name` under the reacted message. | `internal/client/reactions.go`, `internal/store/reactions.go`, [`docs/reactions.md`](docs/reactions.md) |
-| **Nothing is dropped silently** | Stickers (downloadable as images), locations, live locations and contact cards become rows; any other populated kind becomes a `[sin soporte: <field>]` placeholder with a warning instead of vanishing. | `internal/client/unsupported.go` |
-| **Video key frames** | `download_media` of a video also extracts up to six key frames with ffmpeg and returns them inline as images, so an agent can "see" a clip. | `internal/client/frames.go` |
-| **View-once capture** | Unavailable view-once notices are recorded; complete payloads are cached when WhatsApp delivers them; `request_view_once_recovery` asks your own primary phone for an exact direct-chat or group message. Group recovery requires a recorded sender. WhatsApp does **not** deliver view-once content to linked devices by design, so this is best-effort. | `internal/client/view_once.go`, [`docs/view-once.md`](docs/view-once.md) |
-| **History index tools** | `semantic_search`, `index_status`, `history_analytics` proxy to an optional local history service (Postgres + pgvector) at `127.0.0.1:7256`. They return an availability error without it. The optional service and installer are included. | `internal/mcp/tools_memory.go`, [`docs/memory.md`](docs/memory.md) |
-| **Media cache keyed by message ID** | History-synced media used to collide on generated filenames; the cache is now `<message_id>_<filename>`. | `internal/client/download.go` |
-| **Document sending fixes** | Proper MIME types and `FileName` for documents so phones open them. | `internal/client/send.go` |
-| **Audio and video transcription (optional)** | A Python worker transcribes voice notes and the audio track of videos with local faster-whisper. Captions and transcripts are retained together; unavailable media and videos without audio are reported. | `tools/transcriber/` |
+Leer y enviar mensajes, gestionar grupos, trabajar con encuestas y enviar reacciones ya forman parte del proyecto base. Las mejoras anteriores describen las aportaciones de este fork; no son una comparación con todos los clientes de WhatsApp existentes.
 
-### What is indexed
+La implementación y sus límites están documentados en las guías de [memoria y búsqueda](docs/memory.md), [transcripción](tools/transcriber/README.md) y [reacciones](docs/reactions.md). La extracción de fotogramas está en [el código de video](internal/client/frames.go), y los controles de envío en [el código de estado de la cuenta](internal/client/safety.go).
 
-The optional history service is distributed with this repository. Follow [the installation guide](docs/history-install.md) to provision Postgres + pgvector, the worker and the loopback API.
+## Ejemplos de uso
 
-| Content | Semantic index coverage |
+Con los servicios correspondientes instalados, puedes pedirle a tu asistente:
+
+- "Busca la conversación donde acordamos el presupuesto, aunque no usaran esa palabra".
+- "Resume los pendientes de este grupo y dime qué mensajes los respaldan".
+- "Busca qué fecha mencionaron en las notas de voz que ya estén transcritas".
+- "Muéstrame una vista previa de este video y el texto de su audio".
+- "Dime cuánto historial está preparado para búsquedas y cuánto falta".
+
+El servidor proporciona mensajes y herramientas. El asistente interpreta esa información y redacta las respuestas; la calidad depende del modelo y del historial disponible.
+
+## Qué contenido se puede buscar
+
+| Contenido | Cobertura |
 |---|---|
-| Message text and media captions | Text is indexed after ingestion and embedding. |
-| Reactions, contacts and locations | The textual representation is indexed. |
-| Voice notes and video speech | Completed, nonempty transcripts are indexed. Transcription must be running. |
-| Images, stickers and video frames | Captions or descriptive placeholders only. There is no automatic visual embedding or OCR. Agents can inspect downloaded images and up to six video frames. |
-| Attached documents | Metadata and captions only; document contents are not automatically extracted. |
-| View-once or expired media | Only content actually delivered and downloaded is available. |
+| Mensajes y textos que acompañan archivos | Se incorporan a la búsqueda después de procesarlos. |
+| Reacciones, contactos y ubicaciones | Se busca su representación en texto. |
+| Notas de voz y audio de videos | Se busca la transcripción cuando está disponible y procesada. |
+| Imágenes, stickers y fotogramas | Se busca el texto que los acompaña. No hay reconocimiento automático de texto ni búsqueda por contenido visual. |
+| Documentos adjuntos | Se buscan los datos del archivo y el texto que lo acompaña. Su contenido completo no se extrae automáticamente. |
 
-Check `index_status` for the WhatsApp-specific coverage, shared embedding queue size and snapshot age. Capturing a message, transcribing its media and generating its embedding are separate steps. An operational service does not imply the historical backlog is complete. Cached coverage can be stale, and completion covers only the locally available history.
+Guardar un mensaje, transcribir un audio y prepararlo para búsqueda semántica son pasos distintos. Tener el servidor funcionando no significa que todo el histórico esté procesado. `index_status` muestra la cobertura y la antigüedad de la medición.
 
-## Setup
+El servidor debe mantenerse encendido para recibir eventos. Después de una desconexión puede recuperar lo que WhatsApp todavía conserve, pero no garantiza un historial completo ni la descarga de archivos vencidos.
 
-### Prerequisites
+## Instalación del servidor
 
-- Go 1.25+ (build-time only; the runtime needs just the binary).
-- An MCP client that speaks HTTP.
-- FFmpeg (optional): needed for `send_audio_message` conversions and for video key frames.
-- Linux or macOS. **Windows** needs CGO, see [docs/windows.md](docs/windows.md).
+Necesitas Go 1.25 o posterior para compilar y un cliente compatible con MCP por HTTP. Para usarlo en Windows, consulta [la guía de Windows](docs/windows.md). FFmpeg es necesario para extraer fotogramas y convertir audio cuando el formato lo requiere.
 
-### Build
+Desde el directorio donde quieras descargar el proyecto:
 
 ```bash
 git clone https://github.com/0xjesus/whatsapp-mcp.git
 cd whatsapp-mcp
-make build          # writes ./bin/whatsapp-mcp
-make lint test      # go vet + gofmt + unit tests
+make build
+./bin/whatsapp-mcp serve
 ```
 
-The binary is static enough to copy to another machine of the same OS/arch (we build on a laptop and `scp` it to the server; keep the previous binary next to it as a rollback).
+Abre <http://127.0.0.1:8765/pair>. En tu teléfono, entra a WhatsApp, **Dispositivos vinculados**, y escanea el QR. Mantén el proceso `serve` funcionando mientras uses la conexión.
 
-### Pair your phone (first run only)
+Configura tu cliente MCP con esta dirección:
+
+```text
+http://127.0.0.1:8765/mcp
+```
+
+Por ejemplo, un cliente que admita configuración MCP HTTP como Claude Code puede usar:
+
+```json
+{
+  "mcpServers": {
+    "whatsapp": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp"
+    }
+  }
+}
+```
+
+El formato de configuración depende del cliente. Los clientes que sólo aceptan procesos MCP por entrada y salida estándar necesitan un adaptador a HTTP.
+
+### Activar búsqueda semántica y transcripción
+
+El servidor base funciona sin estos componentes. Para habilitarlos:
+
+1. Sigue [la instalación del índice de historial](docs/history-install.md). Incluye un servicio de búsqueda, PostgreSQL con pgvector y el proceso que prepara el texto para búsqueda semántica.
+2. Sigue [la instalación del transcriptor](tools/transcriber/README.md). Usa Python, FFmpeg y faster-whisper para convertir voz a texto en la máquina del servidor.
+3. Consulta `index_status` para revisar el avance. Las transcripciones aparecen en las búsquedas después de incorporarse al índice.
+
+La búsqueda semántica necesita un proveedor de embeddings, las representaciones numéricas del texto que permiten comparar su significado. Puedes configurar un servicio compatible local o externo. Si usas uno externo, recibirá el texto que se procese y puede generar costos.
+
+### Mantenerlo funcionando
+
+Hay plantillas para [systemd en Linux](docs/systemd/whatsapp-mcp.service) y [launchd en macOS](docs/launchd/com.sealjay.whatsapp-mcp.plist). Ejecuta una sola instancia por almacén de datos.
+
+Si el servidor está en otro equipo, accede mediante un túnel SSH y conserva la escucha local. El servidor utiliza `127.0.0.1` por defecto.
+
+## Configuración habitual
+
+| Variable | Uso |
+|---|---|
+| `WHATSAPP_MCP_ADDR` | Dirección del servidor. Por defecto, `127.0.0.1:8765`. |
+| `WHATSAPP_MCP_MEDIA_ROOT` | Directorio permitido para enviar archivos y guardar descargas mediante `output_path`. |
+| `WHATSAPP_MCP_FULL_SYNC` | Solicita una ventana histórica mayor al vincular la cuenta. Activado por defecto; `0` lo desactiva. |
+| `WHATSAPP_MCP_HUMANIZE` | Espacia envíos, muestra que se está escribiendo y aplica límites adicionales. Activado por defecto; `0` lo desactiva. |
+| `WHATSAPP_MCP_DEBUG=1` | Activa registros detallados con ocultamiento parcial de números. |
+| `WHATSAPP_MCP_TOKEN` | Token exigido si habilitas conexiones remotas mediante `-allow-remote`. |
+
+El parámetro `-store` permite elegir dónde guardar la sesión y el historial. Las rutas de archivos devueltas por las herramientas pertenecen al equipo que ejecuta el servidor.
+
+## Herramientas más usadas
+
+| Herramienta | Para qué sirve |
+|---|---|
+| `search_contacts` | Buscar contactos por nombre o número. |
+| `list_chats`, `get_chat` | Consultar conversaciones. |
+| `list_messages`, `get_message_context` | Buscar mensajes y recuperar su contexto. |
+| `semantic_search` | Buscar por significado, texto o ambos con el servicio de historial instalado. |
+| `index_status`, `history_analytics` | Consultar avance y estadísticas del índice. |
+| `download_media` | Descargar archivos y entregar imágenes, audio compatible o fotogramas al asistente. |
+| `request_sync` | Solicitar historial adicional de una conversación. |
+| `send_message`, `send_reply`, `send_file`, `send_audio_message` | Enviar texto, respuestas y archivos. |
+| `send_reaction`, `edit_message`, `delete_message` | Reaccionar, editar o eliminar mensajes según los permisos de WhatsApp. |
+| `get_status`, `pairing_status` | Consultar conexión, estado de la cuenta y vinculación. |
+
+El servidor también ofrece herramientas de grupos, encuestas, contactos y privacidad. Tu cliente puede consultar el catálogo completo mediante MCP `tools/list`.
+
+## Privacidad y límites
+
+- La sesión, el historial y las descargas se guardan en el equipo del servidor. Los datos de sesión permiten acceder a la cuenta: mantenlos privados y fuera del repositorio.
+- El asistente puede enviar al proveedor de su modelo el contenido recuperado por una herramienta. La transcripción local no convierte toda la integración en un sistema sin servicios externos.
+- Los mensajes recibidos son contenido de terceros. El asistente debe tratarlos como información, sin ejecutar instrucciones que aparezcan dentro de ellos.
+- Este proyecto es independiente y usa un cliente no oficial. No está afiliado a Meta ni a WhatsApp. Los límites de envío no eliminan el riesgo de restricciones de cuenta.
+- Las transcripciones dependen de la disponibilidad del archivo y de los límites del transcriptor. La muestra de fotogramas no equivale a revisar cada instante de un video.
+- El ocultamiento parcial en registros no equivale a anonimizar los datos.
+
+## Desarrollo y problemas comunes
 
 ```bash
-./bin/whatsapp-mcp serve            # 127.0.0.1:8765 by default
-open http://127.0.0.1:8765/pair     # or visit the URL manually
+make test
+make test-race
+make lint
+make e2e
 ```
 
-Scan the QR with WhatsApp (*Settings → Linked Devices → Link a Device*). The session persists in `./store/whatsapp.db`. When WhatsApp rotates the linked-device session, `/pair` serves a fresh QR; visit it again. Headless alternative: `./bin/whatsapp-mcp login` renders the QR in the terminal.
+Los trabajadores de historial y transcripción tienen sus propias pruebas, descritas en sus guías. Consulta [cómo contribuir](CONTRIBUTING.md) antes de enviar cambios.
 
-### Connect your MCP client
-
-```jsonc
-// Claude Code — .claude/mcp.json (project) or ~/.claude/mcp.json (user)
-{ "mcpServers": { "whatsapp": { "type": "http", "url": "http://127.0.0.1:8765/mcp" } } }
-```
-
-```jsonc
-// Claude Desktop — ~/Library/Application Support/Claude/claude_desktop_config.json
-{ "mcpServers": { "whatsapp": { "url": "http://127.0.0.1:8765/mcp" } } }
-```
-
-If the daemon runs on another machine, do **not** expose it on the network: forward the port over SSH (`ssh -L 8765:127.0.0.1:8765 host`) and keep the loopback bind. `-allow-remote` exists but requires `WHATSAPP_MCP_TOKEN` and is not how we run it.
-
-### Run it as a service
-
-**Linux (systemd user unit)** — template in [`docs/systemd/whatsapp-mcp.service`](docs/systemd/whatsapp-mcp.service). The variables we set:
-
-```ini
-Environment=WHATSAPP_MCP_ADDR=127.0.0.1:8765
-Environment=WHATSAPP_MCP_MEDIA_ROOT=%h/.local/share/whatsapp-mcp/store/uploads
-Environment=WHATSAPP_MCP_FULL_SYNC=1
-Environment=WHATSAPP_MCP_HUMANIZE=1
-# add the directory that holds ffmpeg to PATH if it is not system-wide
-```
-
-`systemctl --user enable --now whatsapp-mcp` and `loginctl enable-linger $USER` so it survives logout.
-
-**macOS (launchd)** — template in `docs/launchd/`. **Claude Code hook** — `docs/hooks/setup.sh` for project-scoped lifetimes.
-
-### Sending and receiving files
-
-`WHATSAPP_MCP_MEDIA_ROOT` bounds both directions. `send_file` / `send_audio_message` read from it; `download_media` writes decrypted media to the daemon cache at `<store>/<chat_jid>/` and, with `output_path`, also under the root. Symlinks are resolved before the check. Do not keep secrets inside the root.
-
-Sandboxed clients cannot read the daemon cache: point `WHATSAPP_MCP_MEDIA_ROOT` at a directory they can read and always pass `output_path`. For images, stickers, audio (≤ 5 MiB) and video key frames the bytes are also embedded in the tool result, so most agents never need the path.
-
-## Flags and environment
-
-| Name | Meaning |
+| Problema | Qué revisar |
 |---|---|
-| `-addr host:port` / `WHATSAPP_MCP_ADDR` | Bind address (default `127.0.0.1:8765`). |
-| `-store DIR` | Data directory (default `./store`). |
-| `WHATSAPP_MCP_MEDIA_ROOT` | Allowed root for sending and for `output_path`. |
-| `WHATSAPP_MCP_FULL_SYNC=1` | Request the full history window at pairing. |
-| `WHATSAPP_MCP_HUMANIZE=1` | Space sends out, show typing first, cap sends per hour. |
-| `WHATSAPP_MCP_DEBUG=1` / `-debug` | Verbose logs with partial phone-number redaction. |
-| `-allow-remote` + `WHATSAPP_MCP_TOKEN` | Bind a non-loopback address with a bearer token. Avoid; use SSH forwarding. |
+| No conecta o no está vinculado | Abre la página de vinculación y consulta `get_status`. |
+| Ya existe una instancia usando los datos | Mantén un único proceso `serve` por almacén. |
+| La cuenta aparece como restringida | Detén los envíos. Evita reinicios o nuevas vinculaciones repetidas. |
+| La búsqueda semántica no está disponible | Revisa que el servicio de historial esté instalado y funcionando. |
+| Un video se descarga sin fotogramas | Comprueba FFmpeg y el campo `FramesError` de la respuesta. |
+| Faltan mensajes o transcripciones | Revisa cobertura, disponibilidad de archivos y límites de procesamiento. |
 
-## Tools
+## Licencia
 
-50 tools. The ones this fork adds or changes are marked **(fork)**.
-
-### Read / query
-
-| Tool | Purpose |
-|---|---|
-| `search_contacts` | Substring search across cached contact names and numbers |
-| `list_messages` | Query and filter messages; **(fork)** shows `[reaction …]` rows and a `↳` line with reactions under each message |
-| `list_chats`, `get_chat`, `get_message_context` | Chat listing, metadata and context windows |
-| `download_media` | Download persisted media; inlines images, stickers and audio ≤ 5 MiB; **(fork)** returns `Frames` (≤ 6 key frames) for videos |
-| `request_sync` | Ask WhatsApp to backfill history for one chat |
-| `semantic_search`, `index_status`, `history_analytics` **(fork)** | Query the optional local history index (see [`docs/memory.md`](docs/memory.md)) |
-| `view_once_status`, `request_view_once_recovery` **(fork)** | Inspect and best-effort recover view-once media (see [`docs/view-once.md`](docs/view-once.md)) |
-
-### Send
-
-`send_message`, `send_file` (with `view_once`), `send_audio_message`, `send_poll`, `send_poll_vote`, `get_poll_results`, `send_contact_card`.
-
-### Message actions
-
-`mark_read`, `mark_chat_read`, `send_reaction`, `send_reply`, `edit_message`, `delete_message`, `send_typing`.
-
-### Groups
-
-`create_group`, `leave_group`, `list_groups`, `get_group_info`, `update_group_participants`, `set_group_name`, `set_group_topic`, `set_group_announce`, `set_group_locked`, `get_group_invite_link`, `join_group_with_link`.
-
-### Blocklist, privacy, presence, admin
-
-`get_blocklist`, `block_contact`, `unblock_contact`, `send_presence`, `get_privacy_settings`, `set_privacy_setting`, `set_status_message`, `is_on_whatsapp`, `get_status` (**(fork)** includes `health`), `pairing_status`.
-
-## Architecture
-
-```
-cmd/whatsapp-mcp/       login / serve / smoke subcommands
-internal/client/        whatsmeow wrapper: send, download, events, history, reactions, frames, view-once
-internal/daemon/        HTTP server, pairing state machine, /pair endpoint
-internal/mcp/           mark3labs/mcp-go server + tool registrations
-internal/media/         ogg parsing, waveform synthesis, ffmpeg shell-out
-internal/security/      path allowlisting, filename sanitisation, log redaction
-internal/store/         SQLite cache (messages, chats, reactions, mutations, view-once), LID resolution, queries
-tools/transcriber/      optional audio/video transcription worker (Python)
-tools/history/          optional text embedding worker and search API (Python)
-```
-
-`serve` is a long-lived daemon; MCP clients connect and disconnect freely. Events are persisted **only while the daemon runs**; after a gap, whatsmeow's history sync backfills what WhatsApp still retains, and `request_sync` can target one chat. One instance per store (`flock` on `store/.lock`).
-
-Data under `./store/`: `messages.db` (cache, including `reactions`, `message_mutations`, `view_once_media`, `transcripts`), `whatsapp.db` (whatsmeow session), `<chat_jid>/` media cache, `uploads/` media root.
-
-## Limitations
-
-- **Prompt injection.** Incoming messages are untrusted text reaching an LLM; see [the lethal trifecta](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/). The daemon escapes and truncates what it renders (reaction excerpts, emoji) but the agent still reads raw message bodies.
-- **Account risk.** This is an unofficial client. Keep `WHATSAPP_MCP_HUMANIZE=1`, never bulk-send, and stop on `health.state != ok`. Our agent-side rules are in the skill that drives it, not in this repo.
-- **View-once** cannot be guaranteed: WhatsApp withholds it from linked devices.
-- **Gaps** while the daemon is down follow WhatsApp's retention, not ours.
-- **Video frames** are limited to six. When scene detection finds fewer than two frames, sampling spans the clip duration. This is a preview, not an exhaustive visual analysis.
-- **Log redaction** is obfuscation, not anonymisation.
-
-## Development
-
-```bash
-make test          # unit tests
-make test-race     # with -race
-make lint          # go vet + gofmt
-make e2e           # build + JSON-RPC smoke over HTTP (-tags=e2e)
-make upgrade-check # bump whatsmeow@main, tidy, build, test
-```
-
-Tests use real SQLite (in-memory, schema from `internal/store/testdata/seed.sql`) and synthetic fixtures; ffmpeg-dependent tests skip when ffmpeg is absent. The Python workers include unit tests and an isolated Postgres integration test; see the history installation guide for commands.
-
-## Troubleshooting
-
-- **`connect failed …`** — not paired; open `/pair`.
-- **`another whatsapp-mcp instance is already running`** — one `serve` per store.
-- **`health.state` is `restricted` / `temp_banned`** — stop sending, do not restart in a loop, do not re-pair; wait for `health.until`.
-- **No reactions / frames appear after upgrading** — restart the daemon; tables are created at start and history is not re-synced on restart (new events are captured from then on).
-- **`ffmpeg not found`** — needed for audio conversion and video frames; `download_media` still returns the file with `FramesError` set.
-
-## Licence
-
-MIT, see [LICENSE](LICENSE). Upstream copyright belongs to the respective authors of [Sealjay/mcp-whatsapp](https://github.com/Sealjay/mcp-whatsapp) and [lharries/whatsapp-mcp](https://github.com/lharries/whatsapp-mcp).
+[MIT](LICENSE). Se conservan los créditos de [Sealjay/mcp-whatsapp](https://github.com/Sealjay/mcp-whatsapp) y [lharries/whatsapp-mcp](https://github.com/lharries/whatsapp-mcp).
