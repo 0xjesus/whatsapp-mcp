@@ -134,21 +134,58 @@ class Store:
                 source_identity=excluded.source_identity,change_token=NULL,source_stats='{}',updated_at=now()''',(source,identity))
 
     def sync_group_consent(self, groups):
-        """Mirror explicit permissions and remove derived data for denied groups."""
+        """Publish deny-by-default policy first; clean derived data in bounded batches."""
         groups = sorted(set(groups))
-        with self.connection('120s') as db:
+        with self.connection('15s') as db:
             current = [r['chat_jid'] for r in db.execute('SELECT chat_jid FROM group_monitoring_consent ORDER BY chat_jid')]
             initialized = db.execute("SELECT 1 FROM memory_meta WHERE key='group_consent_initialized'").fetchone()
-            if current == groups and initialized:
+            if current != groups or not initialized:
+                db.execute('DELETE FROM group_monitoring_consent')
+                for group in groups:
+                    db.execute('INSERT INTO group_monitoring_consent VALUES(%s)', (group,))
+                db.execute("INSERT INTO memory_meta VALUES('group_consent_initialized','1') ON CONFLICT DO NOTHING")
+                for key,value in [('group_consent_cleanup','pending'),('group_orphan_cursor',''),('group_message_cursor','0'),('group_cleanup_phase','messages')]:
+                    db.execute('INSERT INTO memory_meta VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET value=excluded.value',(key,value))
+        # Policy is already committed. Timeout during cleanup cannot restore permission.
+        try:
+            self.cleanup_group_consent()
+        except Exception as error:
+            from psycopg.errors import QueryCanceled
+            if not isinstance(error, QueryCanceled):
+                raise
+
+    def cleanup_group_consent(self):
+        """At most 200 messages and 500 historical embedding candidates per cycle."""
+        with self.connection('15s') as db:
+            state = db.execute("SELECT value FROM memory_meta WHERE key='group_consent_cleanup'").fetchone()
+            if not state or state['value'] != 'pending':
                 return
-            db.execute('DELETE FROM group_monitoring_consent')
-            for group in groups:
-                db.execute('INSERT INTO group_monitoring_consent VALUES(%s)', (group,))
-            db.execute("DELETE FROM messages WHERE source='whatsapp' AND chat_id LIKE '%%@g.us' AND NOT(chat_id=ANY(%s))", (groups,))
-            # Also remove orphaned text from earlier edits/deletes, which has lost
-            # its group provenance and must not survive a revocation cleanup.
-            db.execute("DELETE FROM embeddings e WHERE NOT EXISTS(SELECT 1 FROM message_chunks c WHERE c.hash=e.hash)")
-            db.execute("INSERT INTO memory_meta VALUES('group_consent_initialized','1') ON CONFLICT DO NOTHING")
+            phase = db.execute("SELECT value FROM memory_meta WHERE key='group_cleanup_phase'").fetchone()
+            if not phase or phase['value'] == 'messages':
+                cursor = db.execute("SELECT value FROM memory_meta WHERE key='group_message_cursor'").fetchone()
+                # Scan a fixed number of primary keys, including other sources. A
+                # LIMIT on matching denied rows alone would still scan unbounded data.
+                candidates = db.execute('SELECT id FROM messages WHERE id>%s ORDER BY id LIMIT 200',
+                                        (int(cursor['value']) if cursor else 0,)).fetchall()
+                if candidates:
+                    db.execute("""DELETE FROM messages m WHERE m.id=ANY(%s) AND m.source='whatsapp'
+                        AND m.chat_id LIKE '%%@g.us' AND NOT EXISTS(
+                            SELECT 1 FROM group_monitoring_consent g WHERE g.chat_jid=m.chat_id)""",
+                        ([r['id'] for r in candidates],))
+                    db.execute("UPDATE memory_meta SET value=%s WHERE key='group_message_cursor'",(str(candidates[-1]['id']),))
+                if len(candidates) == 200:
+                    return
+                db.execute("UPDATE memory_meta SET value='embeddings' WHERE key='group_cleanup_phase'")
+            cursor = db.execute("SELECT value FROM memory_meta WHERE key='group_orphan_cursor'").fetchone()
+            candidates = db.execute('SELECT hash FROM embeddings WHERE hash>%s ORDER BY hash LIMIT 500',
+                                     (cursor['value'] if cursor else '',)).fetchall()
+            if candidates:
+                db.execute("""DELETE FROM embeddings e WHERE e.hash=ANY(%s)
+                    AND NOT EXISTS(SELECT 1 FROM message_chunks c WHERE c.hash=e.hash)""",
+                    ([r['hash'] for r in candidates],))
+                db.execute("UPDATE memory_meta SET value=%s WHERE key='group_orphan_cursor'",(candidates[-1]['hash'],))
+            if len(candidates) < 500:
+                db.execute("UPDATE memory_meta SET value='done' WHERE key='group_consent_cleanup'")
 
     def apply(self, records, source, *, deleted=(), cursor=None, change_seq=None, change_token=None, backfill_done=None, source_stats=None):
         """Messages and ingestion checkpoint commit together; replay is idempotent."""

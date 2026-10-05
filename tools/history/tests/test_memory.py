@@ -45,6 +45,31 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(db.execute('SELECT count(*) AS n FROM embeddings').fetchone()['n'],0)
             self.assertEqual(db.execute('SELECT count(*) AS n FROM messages').fetchone()['n'],0)
 
+    def test_group_cleanup_advances_across_bounded_message_batches(self):
+        self.store.sync_group_consent(['123@g.us'])
+        records=[dict(self.message(str(i),text='private group '+str(i)),chat_id='123@g.us') for i in range(450)]
+        self.store.apply(records,'whatsapp')
+        self.store.sync_group_consent([])
+        self.assertEqual(self.store.pending(10),[])
+        self.assertEqual(self.store.lexical('private',source='whatsapp'),[])
+        with self.store.connection() as db:
+            self.assertEqual(db.execute('SELECT count(*) AS n FROM messages').fetchone()['n'],250)
+        for _ in range(5): self.store.sync_group_consent([])
+        with self.store.connection() as db:
+            self.assertEqual(db.execute('SELECT count(*) AS n FROM messages').fetchone()['n'],0)
+            self.assertEqual(db.execute('SELECT count(*) AS n FROM embeddings').fetchone()['n'],0)
+
+    def test_cleanup_timeout_cannot_roll_back_permission_revocation(self):
+        from unittest.mock import patch
+        from psycopg.errors import QueryCanceled
+        self.store.sync_group_consent(['123@g.us'])
+        self.store.apply([dict(self.message(text='private withheld'),chat_id='123@g.us')],'whatsapp')
+        with patch.object(self.store,'cleanup_group_consent',side_effect=QueryCanceled('synthetic timeout')):
+            self.store.sync_group_consent([])
+        self.assertEqual(self.store.lexical('private',source='whatsapp'),[])
+        self.assertEqual(self.store.pending(10),[])
+        self.store.sync_group_consent([])
+
     def test_restart_deduplicates_and_checkpoint_is_atomic(self):
         from store import Store
         self.store.apply([self.message(), self.message('2')], 'whatsapp', cursor=2)

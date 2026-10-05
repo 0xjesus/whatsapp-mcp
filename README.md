@@ -106,7 +106,7 @@ La búsqueda semántica necesita un proveedor de embeddings, las representacione
 
 ### Autorizar grupos
 
-El monitoreo automático de grupos está desactivado por defecto. Registra una autorización por grupo con [el comando de consentimiento](tools/attachments/README.md#grupos-autorización-explícita). Revocarla detiene nueva captura y procesamiento; el siguiente ciclo del índice retira su contenido de las búsquedas. No borra las conversaciones del teléfono ni el historial bruto existente.
+El monitoreo automático de grupos está desactivado por defecto. Registra una autorización por grupo con [el comando de consentimiento](tools/attachments/README.md#grupos-autorización-explícita). Revocarla detiene nueva captura y procesamiento; el siguiente ciclo del índice bloquea su contenido en las búsquedas y limpia los datos derivados por lotes. No borra las conversaciones del teléfono ni el historial bruto existente.
 
 ### Mantenerlo funcionando
 

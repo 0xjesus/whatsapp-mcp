@@ -55,7 +55,7 @@ python -m tools.attachments.consent list
 python -m tools.attachments.consent revoke --group "$GROUP_JID" --evidence 'Autorización revocada'
 ```
 
-La autorización afecta recepción automática, sincronización histórica, transcripción, análisis de adjuntos e indexación. La revocación bloquea nueva captura y procesamiento, y el siguiente ciclo del índice retira los mensajes del grupo y sus embeddings no compartidos. El historial bruto que ya existía en el almacén de WhatsApp se conserva; la revocación no borra conversaciones en el teléfono. No concede acceso retroactivo a mensajes que WhatsApp ya no entregue.
+La autorización afecta recepción automática, sincronización histórica, transcripción, análisis de adjuntos e indexación. La revocación bloquea nueva captura y procesamiento, y el siguiente ciclo del índice bloquea las búsquedas del grupo. Una limpieza por lotes retira sus mensajes del índice y elimina los embeddings que ya no estén asociados a otro mensaje. El historial bruto que ya existía en el almacén de WhatsApp se conserva; la revocación no borra conversaciones en el teléfono. No concede acceso retroactivo a mensajes que WhatsApp ya no entregue.
 
 Las decisiones quedan registradas localmente. No publiques esa base de datos ni las evidencias de consentimiento.
 
