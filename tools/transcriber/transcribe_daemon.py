@@ -71,12 +71,24 @@ def db():
     return c
 
 
+def monitoring_allowed(c, jid):
+    if not jid.endswith('@g.us'):
+        return jid != 'status@broadcast'
+    try:
+        return c.execute('SELECT 1 FROM group_monitoring_consent WHERE chat_jid=? AND allowed=1',(jid,)).fetchone() is not None
+    except sqlite3.OperationalError:
+        return False
+
+
 def pending(c):
     since = (dt.datetime.now() - dt.timedelta(days=WINDOW_DAYS)).strftime("%Y-%m-%d")
-    return c.execute("""
+    group_filter = "m.chat_jid NOT LIKE '%@g.us'"
+    if c.execute("SELECT 1 FROM sqlite_master WHERE name='group_monitoring_consent'").fetchone():
+        group_filter += " OR EXISTS(SELECT 1 FROM group_monitoring_consent g WHERE g.chat_jid=m.chat_jid AND g.allowed=1)"
+    return c.execute(f"""
         SELECT m.id, m.chat_jid, m.timestamp, m.content, t.status, t.attempts, t.text, m.media_type
         FROM messages m LEFT JOIN transcripts t ON t.message_id = m.id AND t.chat_jid = m.chat_jid
-        WHERE m.media_type IN ('audio','video') AND m.timestamp >= ? AND m.chat_jid != 'status@broadcast'
+        WHERE m.media_type IN ('audio','video') AND m.timestamp >= ? AND m.chat_jid != 'status@broadcast' AND ({group_filter})
           AND (t.status IS NULL OR t.status = 'failed'
                OR (t.status = 'done' AND COALESCE(trim(t.text), '') != ''
                    AND (m.content IS NULL OR m.content = '' OR
@@ -119,6 +131,8 @@ def extract_audio(src, dst):
 def run_once(c, model, mcp):
     """Process a bounded batch, including completed-text repairs without inference."""
     for mid, jid, ts, content, status, attempts, prev_text, media_type in pending(c):
+        if not monitoring_allowed(c, jid):
+            continue
         now = dt.datetime.now().isoformat(timespec='seconds')
         if status == 'done':
             apply_text(c, mid, jid, prev_text, media_type)
@@ -144,6 +158,12 @@ def run_once(c, model, mcp):
             if media_type == 'video' and info.duration > MAX_VIDEO_SECONDS:
                 raise ValueError('video_too_long')
             text = ' '.join(s.text.strip() for s in segments).strip()
+            if not c.in_transaction:
+                c.execute('BEGIN IMMEDIATE')
+            if not monitoring_allowed(c, jid):
+                c.rollback()
+                path.unlink(missing_ok=True)
+                continue
             c.execute("""INSERT INTO transcripts(message_id,chat_jid,text,model,status,attempts,error,created_at,updated_at)
                 VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(message_id,chat_jid) DO UPDATE SET text=excluded.text,
                 model=excluded.model,status='done',attempts=excluded.attempts,error=NULL,updated_at=excluded.updated_at""",

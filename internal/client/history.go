@@ -13,6 +13,9 @@ import (
 // fromTimestamp is zero the newest cached message is used as the anchor;
 // otherwise the provided timestamp is used. Returns a human-readable status.
 func (c *Client) RequestHistorySync(ctx context.Context, chatJID string, fromTimestamp time.Time) (string, error) {
+	if !c.store.MonitoringAllowed(chatJID) {
+		return "", fmt.Errorf("group monitoring requires explicit consent")
+	}
 	c.log.Infof("[SYNC] Requesting history sync for chat: %s", chatJID)
 
 	if c.wa == nil || !c.wa.IsConnected() {

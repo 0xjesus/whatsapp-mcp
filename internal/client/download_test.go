@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"crypto/sha256"
 	"os"
 	"path/filepath"
 	"strings"
@@ -260,5 +261,34 @@ func TestDownload_ExistingVideoOutputIncludesFrames(t *testing.T) {
 	got := c.Download(context.Background(), mid, jid, output)
 	if !got.Success || len(got.Frames) != 4 {
 		t.Fatalf("existing video output must include frames: %+v", got)
+	}
+}
+
+func TestDownloadRejectsStaleCacheAfterMediaReplacement(t *testing.T) {
+	_, _, c := seedCacheHit(t, "447700000099@s.whatsapp.net", "M-CHANGED", "p.jpg")
+	expected := make([]byte, 32)
+	expected[0] = 123
+	if _, err := c.store.DB().Exec("UPDATE messages SET file_sha256=? WHERE id='M-CHANGED'", expected); err != nil {
+		t.Fatal(err)
+	}
+	got := c.Download(context.Background(), "M-CHANGED", "447700000099@s.whatsapp.net", "")
+	if got.Success {
+		t.Fatal("stale bytes returned as replaced attachment")
+	}
+}
+
+func TestDownloadRejectsDifferentExistingOutput(t *testing.T) {
+	_, root, c := seedCacheHit(t, "447700000099@s.whatsapp.net", "M-HASH", "p.jpg")
+	expected := sha256.Sum256([]byte("PRETEND-JPEG-BYTES"))
+	if _, err := c.store.DB().Exec("UPDATE messages SET file_sha256=? WHERE id='M-HASH'", expected[:]); err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(root, "existing.jpg")
+	if err := os.WriteFile(output, []byte("different old content"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	got := c.Download(context.Background(), "M-HASH", "447700000099@s.whatsapp.net", output)
+	if got.Success {
+		t.Fatal("stale caller destination returned as current media")
 	}
 }

@@ -99,7 +99,29 @@ class Source:
                 AFTER INSERT ON memory_changes WHEN new.event_token IS NULL BEGIN
                 UPDATE memory_changes SET event_token=lower(hex(randomblob(16)))
                 WHERE seq=new.seq; END''')
+            if self.kind == 'whatsapp':
+                c.execute("""CREATE TABLE IF NOT EXISTS group_monitoring_consent(
+                    chat_jid TEXT PRIMARY KEY,allowed INTEGER NOT NULL DEFAULT 0,
+                    evidence TEXT NOT NULL,updated_at TEXT NOT NULL)""")
+                for table in ('messages','reactions','poll_votes','message_mutations','view_once_media','transcripts','attachment_analysis'):
+                    guard_columns = {row['name'] for row in c.execute('PRAGMA table_info('+table+')')}
+                    chat_column = 'poll_chat_jid' if table == 'poll_votes' else 'chat_jid'
+                    if chat_column not in guard_columns:
+                        continue
+                    for event in ('INSERT','UPDATE'):
+                        c.execute(f"""CREATE TRIGGER IF NOT EXISTS monitoring_guard_{table}_{event.lower()}
+                            BEFORE {event} ON {table} WHEN new.{chat_column} LIKE '%@g.us'
+                            AND NOT EXISTS(SELECT 1 FROM group_monitoring_consent g WHERE g.chat_jid=new.{chat_column} AND g.allowed=1)
+                            BEGIN SELECT RAISE(IGNORE); END""")
+                for event,prefix in [('INSERT','new'),('UPDATE','new'),('DELETE','old')]:
+                    c.execute(f"""CREATE TRIGGER IF NOT EXISTS memory_consent_{event.lower()}
+                        AFTER {event} ON group_monitoring_consent BEGIN
+                        INSERT INTO memory_changes(chat_id,message_id,op)
+                        SELECT chat_jid,id,'upsert' FROM messages WHERE chat_jid={prefix}.chat_jid;
+                        END""")
             watched = [chat, 'id', f['body'], f['date'], f['sender'], 'media_type']
+            if self.kind == 'whatsapp' and 'file_sha256' in columns:
+                watched += ['file_sha256']
             if self.kind == 'telegram':
                 watched += ['deleted']
             changed = ' OR '.join(f'old.{x} IS NOT new.{x}' for x in watched)
@@ -112,12 +134,19 @@ class Source:
                 AFTER INSERT ON messages BEGIN {enqueue_new} END''')
             c.execute(f'''CREATE TRIGGER IF NOT EXISTS memory_messages_delete
                 AFTER DELETE ON messages BEGIN {enqueue_old} END''')
+            c.execute('DROP TRIGGER IF EXISTS memory_messages_update')
             c.execute(f'''CREATE TRIGGER IF NOT EXISTS memory_messages_update
                 AFTER UPDATE OF {','.join(watched)} ON messages WHEN {changed} BEGIN
                 INSERT INTO memory_changes(chat_id,message_id,op)
                 SELECT CAST(old.{chat} AS TEXT),CAST(old.id AS TEXT),'delete'
                 WHERE old.{chat} IS NOT new.{chat} OR old.id IS NOT new.id;
                 {enqueue_new} END''')
+            if self.kind == 'whatsapp' and self._has(c, 'attachment_analysis'):
+                for event, prefix in [('INSERT', 'new'), ('UPDATE', 'new'), ('DELETE', 'old')]:
+                    c.execute(f'''CREATE TRIGGER IF NOT EXISTS memory_attachment_{event.lower()}
+                        AFTER {event} ON attachment_analysis BEGIN
+                        INSERT INTO memory_changes(chat_id,message_id,op)
+                        VALUES({prefix}.chat_jid,{prefix}.message_id,'upsert'); END''')
             if self._has(c, 'transcripts'):
                 ident = f['transcript_id']
                 def transcript_event(prefix):
@@ -147,6 +176,11 @@ class Source:
             join += f" LEFT JOIN transcripts t ON t.{f['chat']}=m.{f['chat']} AND t.{f['transcript_id']}=m.id"
         else:
             projection += ',NULL AS transcript_text,NULL AS transcript_status'
+        if self.kind == 'whatsapp' and self._has(c, 'attachment_analysis'):
+            projection += ',a.text AS attachment_text,a.status AS attachment_status'
+            join += " LEFT JOIN attachment_analysis a ON a.chat_jid=m.chat_jid AND a.message_id=m.id AND a.media_hash=hex(COALESCE(m.file_sha256,X''))"
+        else:
+            projection += ',NULL AS attachment_text,NULL AS attachment_status'
         return projection + join
 
     def _normalize(self, row):
@@ -162,22 +196,40 @@ class Source:
                 and not any(line.startswith('[Audio del video] ') for line in text.split('\n'))):
             spoken = '[Audio del video] ' + row['transcript_text'].strip()
             text = (text.strip() + '\n' + spoken) if text.strip() else spoken
+        if row['attachment_status'] in ('done','partial') and row['attachment_text']:
+            label = '[Contenido del archivo]' if row['attachment_status'] == 'done' else '[Contenido del archivo: extracción parcial]'
+            text = text + '\n' + label + '\n' + row['attachment_text']
         return dict(rowid=row['rowid'], source=self.kind, chat_id=row['chat_id'],
                     message_id=row['message_id'], timestamp=_epoch(row['timestamp']),
                     sender=row['sender'] or '', chat_name=row['chat_name'] or '',
                     text=text, media_type=row['media_type'] or '')
 
+    def _consent_filter(self, c):
+        if self.kind != 'whatsapp':
+            return ''
+        if not self._has(c, 'group_monitoring_consent'):
+            return " AND m.chat_jid NOT LIKE '%@g.us'"
+        return " AND (m.chat_jid NOT LIKE '%@g.us' OR EXISTS(SELECT 1 FROM group_monitoring_consent g WHERE g.chat_jid=m.chat_jid AND g.allowed=1))"
+
+    def allowed_groups(self):
+        if self.kind != 'whatsapp':
+            return []
+        with self._db() as c:
+            if not self._has(c, 'group_monitoring_consent'):
+                return []
+            return [r[0] for r in c.execute('SELECT chat_jid FROM group_monitoring_consent WHERE allowed=1 ORDER BY chat_jid')]
+
     def backfill_page(self, after_rowid: int, limit: int):
         """Page cached rows, including empty text, excluding Telegram tombstones."""
         with self._db() as c:
-            alive = ' AND COALESCE(m.deleted,0)=0' if self.kind == 'telegram' else ''
+            alive = ' AND COALESCE(m.deleted,0)=0' if self.kind == 'telegram' else self._consent_filter(c)
             rows = c.execute(self._select(c) + f' WHERE m.rowid>?{alive} ORDER BY m.rowid LIMIT ?',
                              (int(after_rowid), _limit(limit))).fetchall()
             return [self._normalize(row) for row in rows]
 
     def get(self, chat_id, message_id):
         with self._db() as c:
-            alive = ' AND COALESCE(m.deleted,0)=0' if self.kind == 'telegram' else ''
+            alive = ' AND COALESCE(m.deleted,0)=0' if self.kind == 'telegram' else self._consent_filter(c)
             row = c.execute(self._select(c) + f" WHERE m.{self.fields['chat']}=? AND m.id=?{alive}",
                             (str(chat_id), str(message_id))).fetchone()
             return self._normalize(row) if row else None

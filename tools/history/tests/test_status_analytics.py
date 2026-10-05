@@ -13,12 +13,13 @@ class CoverageQueryTests(unittest.TestCase):
         db = sqlite3.connect(':memory:')
         self.addCleanup(db.close)
         db.row_factory = lambda cursor, row: dict(zip([c[0] for c in cursor.description], row))
-        db.executescript('''CREATE TABLE messages(id INTEGER,source TEXT,timestamp INTEGER);
+        db.executescript('''CREATE TABLE messages(id INTEGER,source TEXT,timestamp INTEGER,chat_id TEXT DEFAULT 'direct');
+            CREATE TABLE group_monitoring_consent(chat_jid TEXT);
             CREATE TABLE message_chunks(message_pk INTEGER,ordinal INTEGER,hash TEXT);
             CREATE TABLE embeddings(hash TEXT,embedding TEXT);
             CREATE TABLE source_state(source TEXT,backfill_done BOOLEAN);
             CREATE TABLE worker_state(name TEXT);
-            INSERT INTO messages VALUES(1,'whatsapp',1),(2,'whatsapp',2),(3,'telegram',3);
+            INSERT INTO messages(id,source,timestamp) VALUES(1,'whatsapp',1),(2,'whatsapp',2),(3,'telegram',3);
             INSERT INTO message_chunks VALUES(1,0,'shared'),(2,0,'pending'),(3,0,'shared');
             INSERT INTO embeddings VALUES('shared','vector'),('pending',NULL);
             INSERT INTO source_state VALUES('whatsapp',1),('telegram',1);''')
@@ -78,7 +79,7 @@ class StatusAnalyticsTests(unittest.TestCase):
         self.store.apply([self.message(1,'long synthetic body '*500)],'whatsapp')
         with self.store.connection() as db:
             db.execute('''ALTER TABLE messages RENAME TO message_storage;
-                CREATE VIEW messages AS SELECT id,source,timestamp FROM message_storage;''')
+                CREATE VIEW messages AS SELECT id,source,timestamp,chat_id FROM message_storage;''')
         status=self.store.status('whatsapp')
         self.assertEqual((status['messages'],status['text_messages'],status['embedded_messages']),(1,1,0))
 

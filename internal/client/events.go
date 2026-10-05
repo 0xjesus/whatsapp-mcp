@@ -159,7 +159,7 @@ func (c *Client) normalizeIncomingMessage(
 
 // handleMessage persists an incoming message and its chat metadata.
 func (c *Client) handleMessage(msg *events.Message) {
-	if msg == nil {
+	if msg == nil || !c.store.MonitoringAllowed(msg.Info.Chat.String()) {
 		return
 	}
 	raw := msg.RawMessage
@@ -287,6 +287,9 @@ func (c *Client) handleHistorySync(historySync *events.HistorySync) {
 			continue
 		}
 		rawChatJID := *conversation.ID
+		if !c.store.MonitoringAllowed(rawChatJID) {
+			continue
+		}
 
 		jid, err := types.ParseJID(rawChatJID)
 		if err != nil {
@@ -325,6 +328,9 @@ func (c *Client) handleHistorySync(historySync *events.HistorySync) {
 		_ = c.store.StoreChat(chatJID, name, time.Unix(int64(ts), 0))
 
 		for _, msg := range messages {
+			if !c.store.MonitoringAllowed(chatJID) {
+				break
+			}
 			if msg == nil || msg.Message == nil {
 				continue
 			}

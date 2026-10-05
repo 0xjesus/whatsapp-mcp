@@ -62,6 +62,7 @@ class Store:
                 db.execute('CREATE SCHEMA IF NOT EXISTS ' + self.schema)
             db.execute('''
                 CREATE TABLE IF NOT EXISTS memory_meta(key text PRIMARY KEY, value text NOT NULL);
+                CREATE TABLE IF NOT EXISTS group_monitoring_consent(chat_jid text PRIMARY KEY);
                 CREATE TABLE IF NOT EXISTS source_state(
                     source text PRIMARY KEY, cursor bigint NOT NULL DEFAULT 0,
                     change_seq bigint NOT NULL DEFAULT 0, backfill_done boolean NOT NULL DEFAULT false,
@@ -132,6 +133,23 @@ class Store:
                 ON CONFLICT(source) DO UPDATE SET cursor=0,change_seq=0,backfill_done=false,
                 source_identity=excluded.source_identity,change_token=NULL,source_stats='{}',updated_at=now()''',(source,identity))
 
+    def sync_group_consent(self, groups):
+        """Mirror explicit permissions and remove derived data for denied groups."""
+        groups = sorted(set(groups))
+        with self.connection('120s') as db:
+            current = [r['chat_jid'] for r in db.execute('SELECT chat_jid FROM group_monitoring_consent ORDER BY chat_jid')]
+            initialized = db.execute("SELECT 1 FROM memory_meta WHERE key='group_consent_initialized'").fetchone()
+            if current == groups and initialized:
+                return
+            db.execute('DELETE FROM group_monitoring_consent')
+            for group in groups:
+                db.execute('INSERT INTO group_monitoring_consent VALUES(%s)', (group,))
+            db.execute("DELETE FROM messages WHERE source='whatsapp' AND chat_id LIKE '%%@g.us' AND NOT(chat_id=ANY(%s))", (groups,))
+            # Also remove orphaned text from earlier edits/deletes, which has lost
+            # its group provenance and must not survive a revocation cleanup.
+            db.execute("DELETE FROM embeddings e WHERE NOT EXISTS(SELECT 1 FROM message_chunks c WHERE c.hash=e.hash)")
+            db.execute("INSERT INTO memory_meta VALUES('group_consent_initialized','1') ON CONFLICT DO NOTHING")
+
     def apply(self, records, source, *, deleted=(), cursor=None, change_seq=None, change_token=None, backfill_done=None, source_stats=None):
         """Messages and ingestion checkpoint commit together; replay is idempotent."""
         from psycopg.types.json import Jsonb
@@ -178,7 +196,8 @@ class Store:
         with self.connection() as db:
             return db.execute('''SELECT e.hash,e.text,e.attempts,e.ctid::text AS ctid FROM embeddings e
                 WHERE embedding IS NULL AND retry_at<=now()
-                AND EXISTS(SELECT 1 FROM message_chunks c WHERE c.hash=e.hash)
+                AND EXISTS(SELECT 1 FROM message_chunks c JOIN messages m ON m.id=c.message_pk WHERE c.hash=e.hash
+                    AND (m.source!='whatsapp' OR m.chat_id NOT LIKE '%%@g.us' OR EXISTS(SELECT 1 FROM group_monitoring_consent gc WHERE gc.chat_jid=m.chat_id)))
                 ORDER BY priority DESC,retry_at,created_at LIMIT %s''', (min(limit,1024),)).fetchall()
 
     def switch_model(self, label, identity):
@@ -233,7 +252,8 @@ class Store:
     def filters(self, source=None, chat=None, after=None, before=None, sender=None, alias='m'):
         if source is not None and source not in SOURCES:
             raise ValueError('source must be whatsapp or telegram')
-        clauses, values = [], []
+        clauses = [f"({alias}.source!='whatsapp' OR {alias}.chat_id NOT LIKE '%%@g.us' OR EXISTS(SELECT 1 FROM group_monitoring_consent gc WHERE gc.chat_jid={alias}.chat_id))"]
+        values = []
         for key, value, op in [('source',source,'='),('chat_id',chat,'='),('timestamp',after,'>='),('timestamp',before,'<='),('sender',sender,'=')]:
             if value is not None:
                 clauses.append(alias + '.' + key + op + '%s')

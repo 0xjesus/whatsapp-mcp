@@ -145,6 +145,8 @@ def ingestion_loop(store, sources):
                 if source.kind not in installed:
                     source.install_capture()
                     installed.add(source.kind)
+                if source.kind == 'whatsapp':
+                    store.sync_group_consent(source.allowed_groups())
                 plan=recovery_plan(store.state(source.kind),source)
                 if plan['reset_required']:
                     store.reset_source(source.kind,plan['source_identity'])
@@ -211,6 +213,10 @@ def run(root=None, config_path=None, source_paths=None):
     if source_paths is None:
         raise ValueError('Use history.py worker with configured source paths')
     sources=[Source(kind,Path(path)) for kind,path in source_paths.items()]
+    for source in sources:
+        if source.kind == 'whatsapp':
+            source.install_capture()
+            store.sync_group_consent(source.allowed_groups())
     for sig in (signal.SIGTERM,signal.SIGINT):
         signal.signal(sig,lambda *_:STOP.set())
     thread=threading.Thread(target=ingestion_loop,args=(store,sources),daemon=True)

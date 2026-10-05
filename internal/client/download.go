@@ -1,7 +1,9 @@
 package client
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -83,7 +85,7 @@ func (c *Client) Download(ctx context.Context, messageID, chatJID, outputPath st
 	// Skip-if-exists at the caller's destination: symmetric with the cache
 	// short-circuit below. Idempotent re-calls are a no-op.
 	if resolvedOutput != "" {
-		if _, statErr := os.Stat(resolvedOutput); statErr == nil {
+		if cachedMediaMatches(resolvedOutput, fileSHA256) {
 			return withFrames(ctx, DownloadResult{
 				Success:   true,
 				Message:   fmt.Sprintf("Successfully downloaded %s media", mediaType),
@@ -91,6 +93,9 @@ func (c *Client) Download(ctx context.Context, messageID, chatJID, outputPath st
 				Filename:  filename,
 				Path:      resolvedOutput,
 			}, resolvedOutput)
+		}
+		if _, statErr := os.Stat(resolvedOutput); statErr == nil {
+			return DownloadResult{Success: false, Message: "output_path contains different media; choose a new path"}
 		}
 	}
 
@@ -120,7 +125,7 @@ func (c *Client) Download(ctx context.Context, messageID, chatJID, outputPath st
 	// Short-circuit if we already have the file in cache. If output_path is
 	// set, materialise it there from the cache (cheap hardlink + copy
 	// fallback) and return the output path instead.
-	if _, err := os.Stat(localPath); err == nil {
+	if cachedMediaMatches(localPath, fileSHA256) {
 		return withFrames(ctx, finalizeDownload(localPath, absPath, resolvedOutput, mediaType, filename), absPath)
 	}
 
@@ -247,4 +252,21 @@ func extractDirectPathFromURL(url string) string {
 		return url
 	}
 	return "/" + parts[1]
+}
+
+// A replacement can retain the message ID and filename but change its bytes.
+func cachedMediaMatches(path string, expected []byte) bool {
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	if len(expected) == 0 {
+		return true
+	}
+	hash := sha256.New()
+	if _, err = io.Copy(hash, file); err != nil {
+		return false
+	}
+	return bytes.Equal(hash.Sum(nil), expected)
 }

@@ -19,7 +19,7 @@ func (c *Client) ViewOnceStatus(chat, id string) (store.ViewOnce, error) {
 }
 
 func (c *Client) handleUnavailable(evt *events.UndecryptableMessage) {
-	if !evt.IsUnavailable || evt.UnavailableType != events.UnavailableTypeViewOnce {
+	if evt == nil || !c.store.MonitoringAllowed(evt.Info.Chat.String()) || !evt.IsUnavailable || evt.UnavailableType != events.UnavailableTypeViewOnce {
 		return
 	}
 	r := store.ViewOnce{MessageID: evt.Info.ID, ChatJID: c.store.ResolveLIDToJID(evt.Info.Chat.String()), SenderJID: evt.Info.Sender.String(), State: "unavailable"}

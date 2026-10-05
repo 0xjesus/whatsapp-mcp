@@ -92,7 +92,9 @@ class IntegrationTests(unittest.TestCase):
                         INSERT INTO messages VALUES('m1','test-chat','test-author','Bring the telescope',
                             '2026-01-02T10:00:00Z','');
                         INSERT INTO messages VALUES('m2','test-chat','test-author','Buy bread',
-                            '2026-01-02T11:00:00Z','');''')
+                            '2026-01-02T11:00:00Z','');
+                        ALTER TABLE messages ADD COLUMN file_sha256 BLOB;
+                        CREATE TABLE attachment_analysis(message_id TEXT,chat_jid TEXT,text TEXT,status TEXT,media_hash TEXT);''')
                 command = [sys.executable, str(ROOT / 'history.py'), '--config-dir', str(config)]
                 installed = subprocess.run(command + ['install', '--admin-dsn-file', str(admin_file),
                     '--whatsapp-db', str(source), '--data-dir', str(data), '--database', 'history_test',
@@ -154,6 +156,25 @@ class IntegrationTests(unittest.TestCase):
                     with psycopg.connect(credentials['reader_dsn']) as db:
                         return db.execute('SELECT text FROM messages ORDER BY message_id').fetchall() == [('Repair the telescope',)]
                 wait_until(changed)
+                # Late attachment extraction must become searchable, including its final page.
+                with sqlite3.connect(source) as db:
+                    db.execute("INSERT INTO attachment_analysis VALUES('m1','test-chat','Final page orchid 7429','done','')")
+                def attachment_found():
+                    response=request('/search',dict(source='whatsapp',query='orchid',mode='keyword'))
+                    return any('7429' in row['text'] for row in response['results'])
+                wait_until(attachment_found)
+                # Group membership does not authorize indexing; an explicit grant does.
+                with sqlite3.connect(source) as db:
+                    db.execute("INSERT INTO messages VALUES('g1','123@g.us','author','private telescope violet','2026-01-03T00:00:00Z','',NULL)")
+                time.sleep(6)
+                self.assertFalse(request('/search',dict(source='whatsapp',query='violet',mode='keyword'))['results'])
+                with sqlite3.connect(source) as db:
+                    db.execute("INSERT INTO group_monitoring_consent VALUES('123@g.us',1,'explicit synthetic consent','now')")
+                    db.execute("INSERT INTO messages VALUES('g1','123@g.us','author','private telescope violet','2026-01-03T00:00:00Z','',NULL)")
+                wait_until(lambda: bool(request('/search',dict(source='whatsapp',query='violet',mode='keyword'))['results']))
+                with sqlite3.connect(source) as db:
+                    db.execute("UPDATE group_monitoring_consent SET allowed=0 WHERE chat_jid='123@g.us'")
+                wait_until(lambda: not request('/search',dict(source='whatsapp',query='violet',mode='keyword'))['results'])
                 self.assertTrue((data / 'embedding-usage.json').is_file())
                 for process in processes:
                     process.terminate()

@@ -23,6 +23,7 @@ const reactionGroup = "120363000000000001@g.us"
 func reactionClient(t *testing.T) (*Client, *store.Store) {
 	t.Helper()
 	s := newTestStoreWithLIDMap(t, map[string]string{"99887766001": "447700000102"})
+	approveTestGroup(t, s, reactionGroup)
 	c := newClientWithStore(t, s)
 	c.wa = &whatsmeow.Client{Store: &wmstore.Device{}} // history sync reads own ID from here
 	if err := s.StoreChat(reactionGroup, "Test Group", originalTime); err != nil {
@@ -215,6 +216,7 @@ func TestReaction_EmojiChangeReplacesMirror(t *testing.T) {
 func TestReaction_UnseededChatIsCreated(t *testing.T) {
 	c, s := reactionClient(t)
 	fresh := "120363999999999999@g.us"
+	approveTestGroup(t, s, fresh)
 	chat, _ := types.ParseJID(fresh)
 	sender, _ := types.ParseJID("99887766001@lid")
 	raw := &waProto.Message{ReactionMessage: &waProto.ReactionMessage{

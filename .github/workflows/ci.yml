@@ -43,6 +43,19 @@ jobs:
         # signal that the API was removed or renamed.
         run: bash ./scripts/mdtest-parity.sh
 
+  attachments:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r tools/attachments/requirements.txt
+      - run: python -m pip install --no-deps rapidocr-onnxruntime==1.4.4
+      - run: python -m unittest discover -s tools/attachments -p 'test_*.py'
+      - run: python -m unittest discover -s tools/transcriber -p 'test_*.py'
+      - run: PYTHONPATH=tools/history python -m unittest discover -s tools/history/tests -p test_sources.py
+
   upgrade-check:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest

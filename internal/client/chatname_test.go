@@ -215,6 +215,7 @@ func TestHandleMessage_GroupChatNotNormalized(t *testing.T) {
 		t.Fatalf("seed chat: %v", err)
 	}
 
+	approveTestGroup(t, s, groupJID)
 	chatJID, err := types.ParseJID(groupJID)
 	if err != nil {
 		t.Fatalf("parse chat jid: %v", err)

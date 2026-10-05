@@ -20,10 +20,10 @@ class SearchData:
         key=(self.store.schema,source)
         with DIRECTORY_LOCK:
             hit=DIRECTORIES.get(key)
-            if hit and time.monotonic()-hit[0]<120:return hit[1]
+            if source != 'whatsapp' and hit and time.monotonic()-hit[0]<120:return hit[1]
+        where,values=self.store.filters(source=source)
         with self.connection(8) as db:
-            rows=db.execute('''SELECT DISTINCT ON(chat_id) chat_id,chat_name FROM messages
-                WHERE source=%s ORDER BY chat_id DESC,timestamp DESC LIMIT 10000''',(source,)).fetchall()
+            rows=db.execute('SELECT DISTINCT ON(chat_id) chat_id,chat_name FROM messages m WHERE '+where+' ORDER BY chat_id DESC,timestamp DESC LIMIT 10000',values).fetchall()
         with DIRECTORY_LOCK:
             if len(DIRECTORIES)>=16:DIRECTORIES.pop(next(iter(DIRECTORIES)))
             DIRECTORIES[key]=(time.monotonic(),rows)
@@ -32,7 +32,8 @@ class SearchData:
     def resolve(self,source,hint,explicit=False):
         if explicit:
             with self.connection(4) as db:
-                row=db.execute('SELECT chat_id,chat_name FROM messages WHERE source=%s AND chat_id=%s LIMIT 1',(source,hint)).fetchone()
+                where,values=self.store.filters(source=source,chat=hint)
+                row=db.execute('SELECT chat_id,chat_name FROM messages m WHERE '+where+' LIMIT 1',values).fetchone()
             if row:return [row]
         wanted=fold(hint).strip()
         return [r for r in self.directory(source) if wanted in fold(r['chat_name'])][:6]

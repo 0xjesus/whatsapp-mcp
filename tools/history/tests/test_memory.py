@@ -32,6 +32,19 @@ class DatabaseTests(unittest.TestCase):
                     timestamp=1750000000, sender='test', chat_name='Pruebas',
                     text=text, media_type='')
 
+    def test_denied_group_embeddings_are_not_scheduled_and_revoke_cleans_old_versions(self):
+        group = dict(self.message(text='original private version'),chat_id='123@g.us')
+        self.store.apply([group], 'whatsapp')
+        self.assertEqual(self.store.pending(10), [])
+        self.store.sync_group_consent(['123@g.us'])
+        self.assertEqual(len(self.store.pending(10)), 1)
+        self.store.apply([dict(group,text='edited private version')], 'whatsapp')
+        self.store.sync_group_consent([])
+        self.assertEqual(self.store.pending(10), [])
+        with self.store.connection() as db:
+            self.assertEqual(db.execute('SELECT count(*) AS n FROM embeddings').fetchone()['n'],0)
+            self.assertEqual(db.execute('SELECT count(*) AS n FROM messages').fetchone()['n'],0)
+
     def test_restart_deduplicates_and_checkpoint_is_atomic(self):
         from store import Store
         self.store.apply([self.message(), self.message('2')], 'whatsapp', cursor=2)

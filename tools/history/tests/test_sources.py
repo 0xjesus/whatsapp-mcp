@@ -238,6 +238,36 @@ class SourceTests(unittest.TestCase):
         self.write(source, 'UPDATE messages SET text=text')
         self.assertEqual(source.watermark(), watermark)
 
+    def test_attachment_analysis_is_searchable_without_overwriting_caption(self):
+        source = self.source('whatsapp')
+        self.write(source, 'ALTER TABLE messages ADD COLUMN file_sha256 BLOB')
+        self.write(source, "CREATE TABLE attachment_analysis(message_id TEXT,chat_jid TEXT,text TEXT,status TEXT,media_hash TEXT)")
+        self.insert(source, text='original caption', media='document')
+        source.install_capture()
+        watermark = source.watermark()
+        self.write(source, "INSERT INTO attachment_analysis VALUES('same','a','last page evidence','done','')")
+        self.assertIn('last page evidence', source.get('a', 'same')['text'])
+        self.assertIn('original caption', source.get('a', 'same')['text'])
+        self.assertEqual(len(source.changes(watermark, 10)), 1)
+        self.write(source, "UPDATE attachment_analysis SET text='corrected last page'")
+        self.assertIn('corrected last page', source.get('a', 'same')['text'])
+        self.write(source, "UPDATE messages SET file_sha256=X'1234'")
+        self.assertNotIn('last page', source.get('a', 'same')['text'])
+
+    def test_groups_require_individual_consent_and_revocation_enqueues_removal(self):
+        source = self.source('whatsapp')
+        self.insert(source, chat='123@g.us', text='private group')
+        self.insert(source, chat='a', mid='direct')
+        source.install_capture()
+        self.assertIsNone(source.get('123@g.us', 'same'))
+        self.assertEqual(len(source.backfill_page(0, 20)), 1)
+        self.write(source, "INSERT INTO group_monitoring_consent VALUES('123@g.us',1,'explicit test approval','now')")
+        self.assertIsNotNone(source.get('123@g.us', 'same'))
+        cursor = source.watermark()
+        self.write(source, "UPDATE group_monitoring_consent SET allowed=0")
+        self.assertIsNone(source.get('123@g.us', 'same'))
+        self.assertEqual(source.changes(cursor, 20)[0]['chat_id'], '123@g.us')
+
     def test_missing_source_is_never_created(self):
         self.assertIsNotNone(Source, 'Source adapter has not been implemented')
         path = Path(self.temp.name) / 'missing.db'
