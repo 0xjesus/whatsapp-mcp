@@ -250,6 +250,13 @@ class Store:
 
     def apply(self, records, source, *, deleted=(), cursor=None, change_seq=None, change_token=None, backfill_done=None, source_stats=None):
         """Apply one page with bounded SQL round trips and an atomic checkpoint."""
+        records = list(records)
+        keys = [(record['source'], record['chat_id'], record['message_id']) for record in records]
+        if len(set(keys)) != len(keys):
+            # Preserve intermediate cache priorities and validation failures for
+            # repeated keys. The worker's deduplicated pages use the bulk path.
+            return self._apply_sequential(records, source, deleted=deleted, cursor=cursor,
+                change_seq=change_seq, change_token=change_token, backfill_done=backfill_done, source_stats=source_stats)
         from psycopg.types.json import Jsonb
         with self.connection('120s') as db:
             deleted = list(deleted)
@@ -257,8 +264,6 @@ class Store:
                 db.execute('''DELETE FROM messages m USING unnest(%s::text[],%s::text[]) AS d(chat_id,message_id)
                     WHERE m.source=%s AND m.chat_id=d.chat_id AND m.message_id=d.message_id''',
                     ([key[0] for key in deleted], [key[1] for key in deleted], source))
-            # PostgreSQL cannot update the same conflict key twice in one INSERT.
-            # Preserve sequential apply's final value when a page repeats a key.
             prepared = {}
             for record in records:
                 content = {k: record[k] for k in ('source','chat_id','message_id','timestamp','sender','chat_name','text','media_type')}
@@ -305,6 +310,42 @@ class Store:
             db.execute('INSERT INTO source_state(source,updated_at' + ''.join(',' + key for key in columns) +
                 ') VALUES(%s,now()' + ',%s' * len(columns) + ') ON CONFLICT(source) DO UPDATE SET updated_at=excluded.updated_at' +
                 ''.join(',' + key + '=excluded.' + key for key in columns), values)
+
+    def _apply_sequential(self, records, source, *, deleted=(), cursor=None, change_seq=None, change_token=None, backfill_done=None, source_stats=None):
+        """Legacy semantics for pages with duplicate keys, including intermediate writes."""
+        from psycopg.types.json import Jsonb
+        with self.connection('120s') as db:
+            for chat_id, message_id in deleted:
+                db.execute('DELETE FROM messages WHERE source=%s AND chat_id=%s AND message_id=%s',
+                           (source, chat_id, message_id))
+            for record in records:
+                content = {k: record[k] for k in ('source','chat_id','message_id','timestamp','sender','chat_name','text','media_type')}
+                fingerprint = hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
+                previous = db.execute('SELECT id,content_hash FROM messages WHERE source=%s AND chat_id=%s AND message_id=%s',
+                                      (content['source'], content['chat_id'], content['message_id'])).fetchone()
+                if previous and previous['content_hash'] == fingerprint:
+                    continue
+                values = [content[k] for k in ('source','chat_id','message_id','timestamp','sender','chat_name','text','media_type')]
+                row = db.execute('''INSERT INTO messages(source,chat_id,message_id,timestamp,sender,chat_name,text,media_type,content_hash)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(source,chat_id,message_id) DO UPDATE SET
+                    timestamp=excluded.timestamp,sender=excluded.sender,chat_name=excluded.chat_name,text=excluded.text,
+                    media_type=excluded.media_type,content_hash=excluded.content_hash RETURNING id''', values + [fingerprint]).fetchone()
+                message_pk = row['id']
+                db.execute('DELETE FROM message_chunks WHERE message_pk=%s', (message_pk,))
+                for ordinal, text in enumerate(chunks(content['text']) if content['text'].strip() else []):
+                    hash_ = digest(text)
+                    priority=(3 if int(content['timestamp'])>=time.time()-7*86400 else 1) if change_seq is not None else 0
+                    db.execute('''INSERT INTO embeddings(hash,text,priority) VALUES(%s,%s,%s)
+                        ON CONFLICT(hash) DO UPDATE SET priority=greatest(embeddings.priority,excluded.priority)
+                        WHERE embeddings.embedding IS NULL AND embeddings.priority<excluded.priority''', (hash_, text, priority))
+                    db.execute('INSERT INTO message_chunks VALUES(%s,%s,%s)', (message_pk,ordinal,hash_))
+            db.execute('INSERT INTO source_state(source) VALUES(%s) ON CONFLICT DO NOTHING', (source,))
+            updates, values = ['updated_at=now()'], []
+            for key, value in [('cursor',cursor),('change_seq',change_seq),('change_token',change_token),('backfill_done',backfill_done),('source_stats',source_stats)]:
+                if value is not None:
+                    updates.append(key + '=%s')
+                    values.append(Jsonb(value) if key == 'source_stats' else value)
+            db.execute('UPDATE source_state SET ' + ','.join(updates) + ' WHERE source=%s', values + [source])
 
     def heartbeat(self, name, data):
         from psycopg.types.json import Jsonb

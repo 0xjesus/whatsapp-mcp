@@ -77,6 +77,23 @@ class BatchedApplyTests(unittest.TestCase):
         self.assertEqual(actual, [dict(source='telegram',message_id='1',text='telegram edit'),dict(source='whatsapp',message_id='1',text='final edit')])
         self.assertEqual(self.read('SELECT count(*) AS n FROM message_chunks')[0]['n'], 2)
 
+    def test_duplicate_recent_then_historical_preserves_intermediate_priority(self):
+        now = int(time.time())
+        self.store.apply([self.row(text='shared duplicate', timestamp=now),
+                          self.row(text='shared duplicate', timestamp=now-30*86400)],
+                         'whatsapp', change_seq=2)
+        self.assertEqual(self.read('SELECT timestamp FROM messages'), [dict(timestamp=now-30*86400)])
+        self.assertEqual(self.read('SELECT priority FROM embeddings'), [dict(priority=3)])
+
+    def test_invalid_intermediate_duplicate_rolls_back_even_when_final_version_is_valid(self):
+        self.store.apply([self.row('existing')], 'whatsapp', change_seq=1, change_token='before')
+        before = {table:self.read('SELECT * FROM '+table+' ORDER BY 1') for table in ('messages','message_chunks','embeddings','source_state')}
+        with self.assertRaises(Exception):
+            self.store.apply([self.row(timestamp='invalid'),self.row()], 'whatsapp',
+                             deleted=[('synthetic-chat','existing')], change_seq=2, change_token='after')
+        for table, rows in before.items():
+            self.assertEqual(self.read('SELECT * FROM '+table+' ORDER BY 1'), rows, table)
+
     def test_mixed_page_replaces_only_changed_chunks_and_bulk_deletes(self):
         records = [self.row(str(i), 'original body '+str(i)) for i in range(500)]
         self.store.apply(records, 'whatsapp')
