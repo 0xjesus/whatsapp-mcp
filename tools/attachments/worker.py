@@ -130,7 +130,7 @@ def run_once(db, mcp, temp_root):
                 if os.environ.get('WA_ATTACHMENT_BACKEND') == 'openai':
                     existing = db.execute('SELECT metadata FROM attachment_analysis WHERE message_id=? AND chat_jid=? AND media_hash=?', (row['message_id'],row['chat_jid'],row['media_hash'])).fetchone()
                     prior_metadata = json.loads(existing[0]) if existing else {}
-                    local_checkpoint = dict(outcome, cloud_pending=True, retry_at=time.time()+60)
+                    local_checkpoint = dict(outcome, status='partial', cloud_pending=True, retry_at=time.time()+60)
                     if prior_metadata.get('cloud_text'):
                         from tools.attachments.cloud import SEPARATOR
                         local_checkpoint['text'] += SEPARATOR + prior_metadata['cloud_text'].strip()
