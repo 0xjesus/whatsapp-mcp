@@ -48,7 +48,7 @@ class CloudTests(unittest.TestCase):
             with self.assertRaises(cc.CloudError) as caught: client.analyze(CONTENT)
             self.assertNotIn('secret', str(caught.exception))
         self.assertGreater(client.usage_summary()['reserved_usd'], 0)
-        with self.assertRaises(cc.BudgetExceeded): client.analyze(CONTENT)
+        with self.assertRaises(cc.RetryExhausted): client.analyze(CONTENT)
         with client._db() as db:
             db.execute("UPDATE requests SET month='2000-01'")
         with self.assertRaises(cc.CloudError): client.analyze(CONTENT)

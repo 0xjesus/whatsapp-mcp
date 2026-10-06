@@ -121,7 +121,7 @@ class Source:
                     evidence TEXT NOT NULL,updated_at TEXT NOT NULL)""")
                 typed = 'type' in {r['name'] for r in c.execute('PRAGMA table_info(chats)')}
                 channel = " OR EXISTS(SELECT 1 FROM chats WHERE id=new.chat_id AND type='channel')" if typed else ''
-                for table in ('messages', 'transcripts'):
+                for table in ('messages', 'transcripts', 'attachment_analysis', 'message_reactions'):
                     if not self._has(c, table):
                         continue
                     for event in ('INSERT', 'UPDATE'):
@@ -147,6 +147,7 @@ class Source:
                 watched += ['file_sha256']
             if self.kind == 'telegram':
                 watched += ['deleted']
+                if 'media_hash' in columns: watched += ['media_hash']
             changed = ' OR '.join(f'old.{x} IS NOT new.{x}' for x in watched)
             new_op = "CASE WHEN new.deleted=1 THEN 'delete' ELSE 'upsert' END" if self.kind == 'telegram' else "'upsert'"
             enqueue_new = f'''INSERT INTO memory_changes(chat_id,message_id,op)
@@ -164,12 +165,18 @@ class Source:
                 SELECT CAST(old.{chat} AS TEXT),CAST(old.id AS TEXT),'delete'
                 WHERE old.{chat} IS NOT new.{chat} OR old.id IS NOT new.id;
                 {enqueue_new} END''')
-            if self.kind == 'whatsapp' and self._has(c, 'attachment_analysis'):
+            if self._has(c, 'attachment_analysis'):
                 for event, prefix in [('INSERT', 'new'), ('UPDATE', 'new'), ('DELETE', 'old')]:
                     c.execute(f'''CREATE TRIGGER IF NOT EXISTS memory_attachment_{event.lower()}
                         AFTER {event} ON attachment_analysis BEGIN
                         INSERT INTO memory_changes(chat_id,message_id,op)
-                        VALUES({prefix}.chat_jid,{prefix}.message_id,'upsert'); END''')
+                        VALUES({prefix}.{chat},{prefix}.message_id,'upsert'); END''')
+            if self.kind == 'telegram' and self._has(c, 'message_reactions'):
+                for event, prefix in [('INSERT','new'),('UPDATE','new'),('DELETE','old')]:
+                    c.execute(f'''CREATE TRIGGER IF NOT EXISTS memory_reactions_{event.lower()}
+                        AFTER {event} ON message_reactions BEGIN
+                        INSERT INTO memory_changes(chat_id,message_id,op)
+                        VALUES({prefix}.chat_id,{prefix}.message_id,'upsert'); END''')
             if self._has(c, 'transcripts'):
                 ident = f['transcript_id']
                 def transcript_event(prefix):
@@ -202,8 +209,17 @@ class Source:
         if self.kind == 'whatsapp' and self._has(c, 'attachment_analysis'):
             projection += ',a.text AS attachment_text,a.status AS attachment_status'
             join += " LEFT JOIN attachment_analysis a ON a.chat_jid=m.chat_jid AND a.message_id=m.id AND a.media_hash=hex(COALESCE(m.file_sha256,X''))"
+        elif (self.kind == 'telegram' and self._has(c, 'attachment_analysis')
+              and 'media_hash' in {r['name'] for r in c.execute('PRAGMA table_info(messages)')}):
+            projection += ',a.text AS attachment_text,a.status AS attachment_status'
+            join += " LEFT JOIN attachment_analysis a ON a.chat_id=m.chat_id AND a.message_id=m.id AND m.media_hash!='' AND a.media_hash=m.media_hash AND m.deleted=0"
         else:
             projection += ',NULL AS attachment_text,NULL AS attachment_status'
+        if self.kind == 'telegram' and self._has(c, 'message_reactions'):
+            projection += ',r.text AS reactions_text'
+            join += ' LEFT JOIN message_reactions r ON r.chat_id=m.chat_id AND r.message_id=m.id'
+        else:
+            projection += ',NULL AS reactions_text'
         return projection + join
 
     def _normalize(self, row):
@@ -214,11 +230,17 @@ class Source:
         if (row['media_type'] == self.fields['voice'] and placeholder
                 and row['transcript_status'] == 'done'):
             text = PREFIX + ((row['transcript_text'] or '').strip() or '(inaudible)')
-        if (self.kind == 'whatsapp' and row['media_type'] == 'video'
+        if (row['media_type'] in ('video','video_note')
                 and row['transcript_status'] == 'done' and (row['transcript_text'] or '').strip()
                 and not any(line.startswith('[Audio del video] ') for line in text.split('\n'))):
             spoken = '[Audio del video] ' + row['transcript_text'].strip()
             text = (text.strip() + '\n' + spoken) if text.strip() else spoken
+        if (self.kind == 'telegram' and row['media_type'] == 'audio'
+                and row['transcript_status'] == 'done' and (row['transcript_text'] or '').strip()
+                and not any(line.startswith('[Audio] ') for line in text.split('\n'))):
+            text = text.rstrip() + '\n[Audio] ' + row['transcript_text'].strip()
+        if row['reactions_text']:
+            text = text.rstrip() + '\n[Reacciones] ' + row['reactions_text']
         if row['attachment_status'] in ('done','partial') and row['attachment_text']:
             label = '[Contenido del archivo]' if row['attachment_status'] == 'done' else '[Contenido del archivo: extracción parcial]'
             text = text + '\n' + label + '\n' + row['attachment_text']
