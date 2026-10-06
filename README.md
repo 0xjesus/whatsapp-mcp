@@ -16,7 +16,7 @@ Parte de [Sealjay/mcp-whatsapp](https://github.com/Sealjay/mcp-whatsapp), basado
 <a id="what-this-fork-adds"></a>
 
 - **Buscar por lo que recuerdas.** Encuentra conversaciones por su significado, aunque no recuerdes las palabras exactas. Combina búsqueda semántica y búsqueda de texto.
-- **Buscar dentro de imágenes y documentos.** Extrae texto de imágenes, PDF, Word, Excel y presentaciones, y lo incorpora al índice. Puede generar descripciones visuales con un modelo local; los análisis incompletos quedan identificados.
+- **Buscar dentro de imágenes y documentos.** Extrae texto de imágenes, PDF, Word, Excel y presentaciones, y lo incorpora al índice. Puede interpretar imágenes y documentos con OpenAI, conservar el texto original y controlar el gasto con un presupuesto mensual y caché. También admite visión local; los análisis incompletos quedan identificados.
 - **Elegir qué grupos monitorear.** Los grupos están desactivados por defecto. Cada uno necesita autorización explícita, que puedes revocar.
 - **Buscar dentro de notas de voz.** Transcribe los audios disponibles para que puedas consultar lo que se dijo. La transcripción se ejecuta localmente.
 - **Revisar videos desde el asistente.** Transcribe su audio y entrega hasta seis fotogramas para inspeccionar el contenido visual. Los fotogramas son una muestra del clip.
@@ -50,7 +50,7 @@ El servidor proporciona mensajes y herramientas. El asistente interpreta esa inf
 | Mensajes y textos que acompañan archivos | Se incorporan a la búsqueda después de procesarlos. |
 | Reacciones, contactos y ubicaciones | Se busca su representación en texto. |
 | Notas de voz y audio de videos | Se busca la transcripción cuando está disponible y procesada. |
-| Imágenes y stickers | Con el analizador instalado: texto reconocido por OCR y descripciones visuales del modelo local. Los fotogramas de video siguen siendo vistas previas. |
+| Imágenes y stickers | Con el analizador instalado: texto reconocido por OCR y interpretaciones visuales con OpenAI o un modelo local. Los fotogramas de video siguen siendo vistas previas. |
 | Documentos adjuntos | Con el analizador instalado: texto y OCR de PDF, contenido de Word, todas las hojas de Excel y diapositivas de PowerPoint en formatos modernos. Los formatos no compatibles y los límites quedan registrados. |
 
 Guardar un mensaje, transcribir un audio y prepararlo para búsqueda semántica son pasos distintos. Tener el servidor funcionando no significa que todo el histórico esté procesado. `index_status` muestra la cobertura y la antigüedad de la medición.
@@ -99,7 +99,7 @@ El servidor base funciona sin estos componentes. Para habilitarlos:
 
 1. Sigue [la instalación del índice de historial](docs/history-install.md). Incluye un servicio de búsqueda, PostgreSQL con pgvector y el proceso que prepara el texto para búsqueda semántica.
 2. Sigue [la instalación del transcriptor](tools/transcriber/README.md). Usa Python, FFmpeg y faster-whisper para convertir voz a texto en la máquina del servidor.
-3. Instala [el analizador de imágenes y documentos](tools/attachments/README.md) para OCR, extracción de archivos y descripción visual local.
+3. Instala [el analizador de imágenes y documentos](tools/attachments/README.md) para OCR, extracción de archivos e interpretación con OpenAI o visión local.
 4. Consulta `index_status` para revisar el avance. Las transcripciones aparecen en las búsquedas después de incorporarse al índice.
 
 La búsqueda semántica necesita un proveedor de embeddings, las representaciones numéricas del texto que permiten comparar su significado. Puedes configurar un servicio compatible local o externo. Si usas uno externo, recibirá el texto que se procese y puede generar costos.

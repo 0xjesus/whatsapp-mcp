@@ -46,6 +46,7 @@ def allowed(db, jid):
 
 def pending(db, limit=4):
     vision_enabled = bool(os.environ.get('WA_VISION_MODEL'))
+    cloud_enabled = os.environ.get('WA_ATTACHMENT_BACKEND') == 'openai'
     return [dict(row) for row in db.execute('''SELECT m.id AS message_id,m.chat_jid,m.filename,m.media_type,
         hex(COALESCE(m.file_sha256,X'')) AS media_hash,
         CASE WHEN a.media_hash=hex(COALESCE(m.file_sha256,X'')) THEN COALESCE(a.attempts,0) ELSE 0 END AS attempts
@@ -54,8 +55,11 @@ def pending(db, limit=4):
         AND (m.chat_jid NOT LIKE '%@g.us' OR EXISTS(SELECT 1 FROM group_monitoring_consent g WHERE g.chat_jid=m.chat_jid AND g.allowed=1))
         AND (a.message_id IS NULL OR a.media_hash!=hex(COALESCE(m.file_sha256,X''))
              OR (a.status='failed' AND a.retry_at<=?)
-             OR (? AND a.status='partial' AND a.error='vision_not_configured'))
-        ORDER BY CASE WHEN m.timestamp>=datetime('now','-1 day') THEN 0 ELSE 1 END,m.timestamp ASC,m.rowid ASC LIMIT ?''', (time.time(), vision_enabled, limit))]
+             OR (? AND a.status='partial' AND a.error='vision_not_configured')
+             OR (? AND a.status IN ('done','partial') AND a.retry_at<=?
+                 AND (COALESCE(json_extract(a.metadata,'$.cloud_version'),'')!='openai-v1'
+                      OR json_extract(a.metadata,'$.cloud_pending')=1)))
+        ORDER BY CASE WHEN m.timestamp>=datetime('now','-1 day') THEN 0 ELSE 1 END,m.timestamp ASC,m.rowid ASC LIMIT ?''', (time.time(), vision_enabled and not cloud_enabled, cloud_enabled, time.time(), limit))]
 
 
 def save(db, row, result):
@@ -68,7 +72,16 @@ def save(db, row, result):
         db.commit()
         return False
     status = result['status']
-    attempts = row['attempts'] + 1
+    attempts = row['attempts'] + (0 if result.get('cloud_pending') else 1)
+    if status == 'failed':
+        prior = db.execute('SELECT text,status,metadata FROM attachment_analysis WHERE message_id=? AND chat_jid=? AND media_hash=?', (row['message_id'],row['chat_jid'],row['media_hash'])).fetchone()
+        if prior and prior['text']:
+            result = dict(result, text=prior['text'])
+            if os.environ.get('WA_ATTACHMENT_BACKEND') == 'openai':
+                merged = json.loads(prior['metadata'])
+                merged.update(result)
+                result = dict(merged, cloud_pending=True, retry_at=time.time()+3600)
+                status = 'partial'
     if status == 'failed' and attempts >= 3:
         status = 'failed_permanent'
     metadata = {k:v for k,v in result.items() if k not in ('text','status')}
@@ -77,7 +90,7 @@ def save(db, row, result):
         media_hash=excluded.media_hash,text=excluded.text,status=excluded.status,attempts=excluded.attempts,
         error=excluded.error,metadata=excluded.metadata,updated_at=excluded.updated_at,retry_at=excluded.retry_at''',
         (row['message_id'],row['chat_jid'],row['media_hash'],result.get('text',''),status,attempts,
-         result.get('reason'),json.dumps(metadata),time.time()+min(3600,60*2**attempts)))
+         result.get('reason'),json.dumps(metadata),result.get('retry_at',time.time()+min(3600,60*2**min(attempts,8)))))
     db.commit()
     return True
 
@@ -113,6 +126,28 @@ def run_once(db, mcp, temp_root):
                 if not allowed(db, row['chat_jid']):
                     continue
                 outcome = analyze(path, row['filename'], row['media_type'])
+                # Persist local evidence before cloud configuration or rendering can fail.
+                if os.environ.get('WA_ATTACHMENT_BACKEND') == 'openai':
+                    existing = db.execute('SELECT metadata FROM attachment_analysis WHERE message_id=? AND chat_jid=? AND media_hash=?', (row['message_id'],row['chat_jid'],row['media_hash'])).fetchone()
+                    prior_metadata = json.loads(existing[0]) if existing else {}
+                    local_checkpoint = dict(outcome, cloud_pending=True, retry_at=time.time()+60)
+                    if prior_metadata.get('cloud_text'):
+                        from tools.attachments.cloud import SEPARATOR
+                        local_checkpoint['text'] += SEPARATOR + prior_metadata['cloud_text'].strip()
+                    save(db,row,dict(prior_metadata, **local_checkpoint))
+                if os.environ.get('WA_ATTACHMENT_BACKEND') == 'openai':
+                    from tools.attachments.cloud_client import CloudClient
+                    from tools.attachments.cloud import enrich
+                    def authorized():
+                        current = db.execute("SELECT hex(COALESCE(file_sha256,X'')) FROM messages WHERE id=? AND chat_jid=?", (row['message_id'],row['chat_jid'])).fetchone()
+                        return bool(current and current[0]==row['media_hash'] and allowed(db,row['chat_jid']))
+                    client = CloudClient(Path(os.environ['WA_STORE'])/'attachment-cloud.db',
+                        Path(os.environ['WA_OPENAI_KEY_FILE']),
+                        monthly_budget=float(os.environ.get('WA_ATTACHMENT_MONTHLY_USD','10')),
+                        model=os.environ.get('WA_OPENAI_MODEL','gpt-5.4-mini-2026-03-17'),
+                        authorize=authorized)
+                    outcome = enrich(path,row['filename'],row['media_type'],outcome,client,
+                                     previous=prior_metadata)
             save(db, row, outcome)
             print(json.dumps({'component':'attachments','status':outcome['status']}), flush=True)
         except Exception as error:
@@ -134,7 +169,7 @@ def main():
         resource.setrlimit(resource.RLIMIT_CPU, (540, 540))
         from tools.attachments.extract import extract
         vision = None
-        if os.environ.get('WA_VISION_MODEL'):
+        if os.environ.get('WA_VISION_MODEL') and os.environ.get('WA_ATTACHMENT_BACKEND') != 'openai':
             from tools.attachments.vision import describe
             vision = describe
         print(json.dumps(extract(args.extract, args.filename, args.media_type, vision=vision)))

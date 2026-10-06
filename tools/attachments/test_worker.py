@@ -57,4 +57,37 @@ class WorkerTests(unittest.TestCase):
         with patch.dict('os.environ',{'WA_VISION_MODEL':'/synthetic/local/model'}):
             self.assertEqual(len(self.worker.pending(self.db)),1)
 
+    def test_cloud_upgrade_and_budget_deferral(self):
+        import time
+        row = self.worker.pending(self.db)[0]
+        self.worker.save(self.db,row,{'text':'evidence','status':'done'})
+        self.db.execute('UPDATE attachment_analysis SET retry_at=0'); self.db.commit()
+        with patch.dict('os.environ',{'WA_ATTACHMENT_BACKEND':'openai'}):
+            self.assertEqual(len(self.worker.pending(self.db)),1)
+            self.worker.save(self.db,row,{'text':'evidence','status':'partial',
+                'cloud_version':'openai-v1','cloud_pending':True,'retry_at':time.time()+1000})
+            self.assertEqual(self.worker.pending(self.db),[])
+            self.assertEqual(self.db.execute('SELECT attempts FROM attachment_analysis').fetchone()[0],0)
+
+    def test_upgrade_failure_keeps_previous_searchable_evidence(self):
+        row = self.worker.pending(self.db)[0]
+        self.worker.save(self.db,row,{'text':'existing evidence','status':'done'})
+        with patch.dict('os.environ',{'WA_ATTACHMENT_BACKEND':'openai'}):
+            self.worker.save(self.db,row,{'text':'','status':'failed','reason':'download_unavailable'})
+        got=self.db.execute('SELECT text,status FROM attachment_analysis').fetchone()
+        self.assertEqual(tuple(got),('existing evidence','partial'))
+
+    def test_first_cloud_configuration_failure_keeps_fresh_extraction(self):
+        import os
+        self.db.execute("UPDATE messages SET file_sha256=X'' WHERE id='one'")
+        self.db.commit()
+        class Mcp:
+            def call(self, name, args):
+                Path(args['output_path']).write_text('synthetic document')
+                return {}
+        with patch.dict(os.environ,{'WA_ATTACHMENT_BACKEND':'openai','WA_STORE':self.temp.name},clear=True), patch.object(self.worker,'analyze',return_value={'text':'fresh evidence','status':'done'}):
+            self.worker.run_once(self.db,Mcp(),self.temp.name)
+        got=self.db.execute('SELECT text,status FROM attachment_analysis').fetchone()
+        self.assertEqual(tuple(got),('fresh evidence','partial'))
+
 if __name__ == '__main__': unittest.main()
