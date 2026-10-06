@@ -333,7 +333,8 @@ class Source:
                 c.execute(f"""CREATE TRIGGER {prefix}_delete AFTER DELETE ON group_monitoring_consent BEGIN
                     DELETE FROM memory_group_rescan WHERE chat_id=CAST(old.{chat_column} AS TEXT); END""")
                 continue
-            transition = '' if event == 'INSERT' else f' AND (old.allowed!=1 OR old.evidence IS NOT new.evidence OR {renewed})'
+            # New evidence alone must not rewind recovery while permission is still valid.
+            transition = '' if event == 'INSERT' else f' AND (old.allowed!=1 OR {renewed})'
             c.execute(f"""CREATE TRIGGER {prefix}_{event.lower()} AFTER {event} ON group_monitoring_consent
                 WHEN new.allowed=1 AND {fresh}{transition} BEGIN
                 INSERT INTO memory_group_rescan(chat_id,cursor) VALUES(CAST(new.{chat_column} AS TEXT),NULL)
