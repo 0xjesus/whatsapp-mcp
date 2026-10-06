@@ -32,8 +32,8 @@ def ingest_step(store, source):
     if not events:
         return False
     records,deleted=[],[]
-    for chat_id,message_id in dict.fromkeys((e['chat_id'],e['message_id']) for e in events):
-        row=source.get(chat_id,message_id)
+    keys=list(dict.fromkeys((e['chat_id'],e['message_id']) for e in events))
+    for (chat_id,message_id),row in zip(keys,source.get_many(keys),strict=True):
         if row is None:
             deleted.append((chat_id,message_id))
         else:
