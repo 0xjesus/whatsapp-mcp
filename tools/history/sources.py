@@ -328,7 +328,8 @@ class Source:
             return
         predicate = f'{column}=?'
         args = [peer]
-        if pending['cursor'] is not None:
+        # Older queues use an empty string for the initial keyset position.
+        if pending['cursor'] not in (None, ''):
             predicate += ' AND id>?'
             args.append(int(pending['cursor']) if self.kind == 'telegram' else pending['cursor'])
         rows = c.execute(f'SELECT id FROM messages WHERE {predicate} ORDER BY id LIMIT ?',

@@ -393,6 +393,33 @@ class GroupRescanTests(unittest.TestCase):
     write = SourceTests.write
     insert = SourceTests.insert
 
+    def test_legacy_empty_cursor_cannot_block_live_changes_or_group_recovery(self):
+        source = self.source('telegram')
+        for mid in range(1, 451):
+            self.insert(source, chat=-1, mid=mid)
+        source.install_capture()
+        self.write(source, "INSERT INTO group_monitoring_consent VALUES(-1,1,'explicit approval','now')")
+        self.write(source, "UPDATE memory_group_rescan SET cursor='' WHERE chat_id='-1'")
+        self.insert(source, chat=-1, mid=451, text='synthetic recent message')
+
+        batch = source.changes(0, 1000)
+        self.assertEqual(batch[0]['message_id'], '451', 'Live changes must keep priority')
+        self.assertEqual(len(batch), 201, 'Recovery must remain bounded to 200 rows')
+        seen = {row['message_id'] for row in batch}
+        checkpoint = batch[-1]['seq']
+        source = Source('telegram', source.path)
+        source.install_capture()
+        for _ in range(4):
+            batch = source.changes(checkpoint, 1000)
+            if not batch:
+                break
+            self.assertLessEqual(len(batch), 200)
+            seen.update(row['message_id'] for row in batch)
+            checkpoint = batch[-1]['seq']
+        self.assertEqual(seen, {str(mid) for mid in range(1, 452)})
+        with sqlite3.connect(source.path) as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM memory_group_rescan').fetchone()[0], 0)
+
     def test_approval_is_constant_size_and_rescan_is_bounded_durable(self):
         for kind, chat in [('whatsapp', '123@g.us'), ('telegram', -1)]:
             with self.subTest(kind=kind):
