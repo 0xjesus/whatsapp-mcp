@@ -16,6 +16,7 @@ func (s *Server) registerTools() {
 	s.registerQueryTools()
 	s.registerMemoryTools()
 	s.registerSendTools()
+	s.registerSchedulerTools()
 	s.registerMessageTools()
 
 	// Phase 1 — group management + blocklist.

@@ -75,7 +75,7 @@ def monitoring_allowed(c, jid):
     if not jid.endswith('@g.us'):
         return jid != 'status@broadcast'
     try:
-        return c.execute('SELECT 1 FROM group_monitoring_consent WHERE chat_jid=? AND allowed=1',(jid,)).fetchone() is not None
+        return c.execute("SELECT 1 FROM group_monitoring_consent WHERE chat_jid=? AND allowed=1 AND (evidence NOT LIKE 'auto:max-members:%' OR CAST(strftime('%s',updated_at) AS INTEGER)>CAST(strftime('%s','now') AS INTEGER)-900)",(jid,)).fetchone() is not None
     except sqlite3.OperationalError:
         return False
 
@@ -84,7 +84,7 @@ def pending(c):
     since = (dt.datetime.now() - dt.timedelta(days=WINDOW_DAYS)).strftime("%Y-%m-%d")
     group_filter = "m.chat_jid NOT LIKE '%@g.us'"
     if c.execute("SELECT 1 FROM sqlite_master WHERE name='group_monitoring_consent'").fetchone():
-        group_filter += " OR EXISTS(SELECT 1 FROM group_monitoring_consent g WHERE g.chat_jid=m.chat_jid AND g.allowed=1)"
+        group_filter += " OR EXISTS(SELECT 1 FROM group_monitoring_consent g WHERE g.chat_jid=m.chat_jid AND g.allowed=1 AND (g.evidence NOT LIKE 'auto:max-members:%' OR CAST(strftime('%s',g.updated_at) AS INTEGER)>CAST(strftime('%s','now') AS INTEGER)-900))"
     return c.execute(f"""
         SELECT m.id, m.chat_jid, m.timestamp, m.content, t.status, t.attempts, t.text, m.media_type
         FROM messages m LEFT JOIN transcripts t ON t.message_id = m.id AND t.chat_jid = m.chat_jid

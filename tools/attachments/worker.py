@@ -41,7 +41,7 @@ def initialize(db):
 def allowed(db, jid):
     if not jid.endswith('@g.us'):
         return jid != 'status@broadcast'
-    return db.execute('SELECT 1 FROM group_monitoring_consent WHERE chat_jid=? AND allowed=1', (jid,)).fetchone() is not None
+    return db.execute("SELECT 1 FROM group_monitoring_consent WHERE chat_jid=? AND allowed=1 AND (evidence NOT LIKE 'auto:max-members:%' OR CAST(strftime('%s',updated_at) AS INTEGER)>CAST(strftime('%s','now') AS INTEGER)-900)", (jid,)).fetchone() is not None
 
 
 def pending(db, limit=4):
@@ -52,7 +52,7 @@ def pending(db, limit=4):
         CASE WHEN a.media_hash=hex(COALESCE(m.file_sha256,X'')) THEN COALESCE(a.attempts,0) ELSE 0 END AS attempts
         FROM messages m LEFT JOIN attachment_analysis a ON a.message_id=m.id AND a.chat_jid=m.chat_jid
         WHERE m.media_type IN ('image','sticker','document') AND m.chat_jid!='status@broadcast'
-        AND (m.chat_jid NOT LIKE '%@g.us' OR EXISTS(SELECT 1 FROM group_monitoring_consent g WHERE g.chat_jid=m.chat_jid AND g.allowed=1))
+        AND (m.chat_jid NOT LIKE '%@g.us' OR EXISTS(SELECT 1 FROM group_monitoring_consent g WHERE g.chat_jid=m.chat_jid AND g.allowed=1 AND (g.evidence NOT LIKE 'auto:max-members:%' OR CAST(strftime('%s',g.updated_at) AS INTEGER)>CAST(strftime('%s','now') AS INTEGER)-900)))
         AND (a.message_id IS NULL OR a.media_hash!=hex(COALESCE(m.file_sha256,X''))
              OR (a.status='failed' AND a.retry_at<=?)
              OR (? AND a.status='partial' AND a.error='vision_not_configured')

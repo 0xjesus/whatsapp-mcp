@@ -109,13 +109,16 @@ class Source:
                     if chat_column not in guard_columns:
                         continue
                     for event in ('INSERT','UPDATE'):
+                        c.execute(f"DROP TRIGGER IF EXISTS monitoring_guard_{table}_{event.lower()}")
                         c.execute(f"""CREATE TRIGGER IF NOT EXISTS monitoring_guard_{table}_{event.lower()}
                             BEFORE {event} ON {table} WHEN new.{chat_column} LIKE '%@g.us'
-                            AND NOT EXISTS(SELECT 1 FROM group_monitoring_consent g WHERE g.chat_jid=new.{chat_column} AND g.allowed=1)
+                            AND NOT EXISTS(SELECT 1 FROM group_monitoring_consent g WHERE g.chat_jid=new.{chat_column} AND g.allowed=1 AND (g.evidence NOT LIKE 'auto:max-members:%' OR CAST(strftime('%s',g.updated_at) AS INTEGER)>CAST(strftime('%s','now') AS INTEGER)-900))
                             BEGIN SELECT RAISE(IGNORE); END""")
                 for event,prefix in [('INSERT','new'),('UPDATE','new'),('DELETE','old')]:
+                    condition = "" if event != 'UPDATE' else "WHEN old.allowed!=new.allowed OR old.evidence!=new.evidence OR (new.allowed=1 AND new.evidence LIKE 'auto:max-members:%' AND (CAST(strftime('%s',old.updated_at) AS INTEGER) IS NULL OR CAST(strftime('%s',old.updated_at) AS INTEGER)<=CAST(strftime('%s','now') AS INTEGER)-900))"
+                    c.execute(f"DROP TRIGGER IF EXISTS memory_consent_{event.lower()}")
                     c.execute(f"""CREATE TRIGGER IF NOT EXISTS memory_consent_{event.lower()}
-                        AFTER {event} ON group_monitoring_consent BEGIN
+                        AFTER {event} ON group_monitoring_consent {condition} BEGIN
                         INSERT INTO memory_changes(chat_id,message_id,op)
                         SELECT chat_jid,id,'upsert' FROM messages WHERE chat_jid={prefix}.chat_jid;
                         END""")
@@ -129,13 +132,16 @@ class Source:
                     if not self._has(c, table):
                         continue
                     for event in ('INSERT', 'UPDATE'):
+                        c.execute(f"DROP TRIGGER IF EXISTS memory_telegram_guard_{table}_{event.lower()}")
                         c.execute(f"""CREATE TRIGGER IF NOT EXISTS memory_telegram_guard_{table}_{event.lower()}
                             BEFORE {event} ON {table} WHEN NOT (new.chat_id>0{channel}
-                            OR EXISTS(SELECT 1 FROM group_monitoring_consent g WHERE g.chat_id=new.chat_id AND g.allowed=1))
+                            OR EXISTS(SELECT 1 FROM group_monitoring_consent g WHERE g.chat_id=new.chat_id AND g.allowed=1 AND (g.evidence NOT LIKE 'auto:max-members:%' OR CAST(strftime('%s',g.updated_at) AS INTEGER)>CAST(strftime('%s','now') AS INTEGER)-900)))
                             BEGIN SELECT RAISE(IGNORE); END""")
                 for event,prefix in [('INSERT','new'),('UPDATE','new'),('DELETE','old')]:
+                    condition = "" if event != 'UPDATE' else "WHEN old.allowed!=new.allowed OR old.evidence!=new.evidence OR (new.allowed=1 AND new.evidence LIKE 'auto:max-members:%' AND (CAST(strftime('%s',old.updated_at) AS INTEGER) IS NULL OR CAST(strftime('%s',old.updated_at) AS INTEGER)<=CAST(strftime('%s','now') AS INTEGER)-900))"
+                    c.execute(f"DROP TRIGGER IF EXISTS memory_telegram_consent_{event.lower()}")
                     c.execute(f"""CREATE TRIGGER IF NOT EXISTS memory_telegram_consent_{event.lower()}
-                        AFTER {event} ON group_monitoring_consent BEGIN
+                        AFTER {event} ON group_monitoring_consent {condition} BEGIN
                         INSERT INTO memory_changes(chat_id,message_id,op)
                         SELECT CAST(chat_id AS TEXT),CAST(id AS TEXT),'upsert' FROM messages WHERE chat_id={prefix}.chat_id;
                         END""")
@@ -239,19 +245,19 @@ class Source:
         if self.kind == 'telegram':
             typed = 'type' in {r['name'] for r in c.execute('PRAGMA table_info(chats)')}
             channel = " OR c.type='channel'" if typed else ''
-            consent = " OR EXISTS(SELECT 1 FROM group_monitoring_consent g WHERE g.chat_id=m.chat_id AND g.allowed=1)" if self._has(c, 'group_monitoring_consent') else ''
+            consent = " OR EXISTS(SELECT 1 FROM group_monitoring_consent g WHERE g.chat_id=m.chat_id AND g.allowed=1 AND (g.evidence NOT LIKE 'auto:max-members:%' OR CAST(strftime('%s',g.updated_at) AS INTEGER)>CAST(strftime('%s','now') AS INTEGER)-900))" if self._has(c, 'group_monitoring_consent') else ''
             return f" AND (m.chat_id>0{channel}{consent})"
 
         if not self._has(c, 'group_monitoring_consent'):
             return " AND m.chat_jid NOT LIKE '%@g.us'"
-        return " AND (m.chat_jid NOT LIKE '%@g.us' OR EXISTS(SELECT 1 FROM group_monitoring_consent g WHERE g.chat_jid=m.chat_jid AND g.allowed=1))"
+        return " AND (m.chat_jid NOT LIKE '%@g.us' OR EXISTS(SELECT 1 FROM group_monitoring_consent g WHERE g.chat_jid=m.chat_jid AND g.allowed=1 AND (g.evidence NOT LIKE 'auto:max-members:%' OR CAST(strftime('%s',g.updated_at) AS INTEGER)>CAST(strftime('%s','now') AS INTEGER)-900)))"
 
     def allowed_groups(self):
         with self._db() as c:
             if not self._has(c, 'group_monitoring_consent'):
                 return []
             column = 'chat_jid' if self.kind == 'whatsapp' else 'chat_id'
-            return [str(r[0]) for r in c.execute(f'SELECT {column} FROM group_monitoring_consent WHERE allowed=1 ORDER BY {column}')]
+            return [str(r[0]) for r in c.execute(f"SELECT {column} FROM group_monitoring_consent WHERE allowed=1 AND (evidence NOT LIKE 'auto:max-members:%' OR CAST(strftime('%s',updated_at) AS INTEGER)>CAST(strftime('%s','now') AS INTEGER)-900) ORDER BY {column}")]
 
     def telegram_channels(self):
         if self.kind != 'telegram':

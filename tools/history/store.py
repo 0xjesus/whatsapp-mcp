@@ -138,6 +138,7 @@ class Store:
         """Publish deny-by-default policy first; clean derived data in bounded batches."""
         groups = sorted(set(groups))
         with self.connection('15s') as db:
+            db.execute("INSERT INTO memory_meta VALUES('whatsapp_consent_refreshed_at',%s) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(time.time()),))
             current = [r['chat_jid'] for r in db.execute('SELECT chat_jid FROM group_monitoring_consent ORDER BY chat_jid')]
             initialized = db.execute("SELECT 1 FROM memory_meta WHERE key='group_consent_initialized'").fetchone()
             if current != groups or not initialized:
@@ -291,11 +292,12 @@ class Store:
 
     def pending(self, limit=16):
         freshness = self.telegram_consent_freshness()
+        whatsapp_freshness = self.whatsapp_consent_freshness()
         with self.connection() as db:
             return db.execute('''SELECT e.hash,e.text,e.attempts,e.ctid::text AS ctid FROM embeddings e
                 WHERE embedding IS NULL AND retry_at<=now()
                 AND EXISTS(SELECT 1 FROM message_chunks c JOIN messages m ON m.id=c.message_pk WHERE c.hash=e.hash
-                    AND (m.source!='whatsapp' OR m.chat_id NOT LIKE '%%@g.us' OR EXISTS(SELECT 1 FROM group_monitoring_consent gc WHERE gc.chat_jid=m.chat_id))
+                    AND (m.source!='whatsapp' OR m.chat_id NOT LIKE '%%@g.us' OR EXISTS(SELECT 1 FROM group_monitoring_consent gc WHERE gc.chat_jid=m.chat_id) AND ''' + whatsapp_freshness + ''')
                     AND (m.source!='telegram' OR m.chat_id NOT LIKE '-%%' OR (EXISTS(SELECT 1 FROM telegram_monitoring_allowed tc WHERE tc.chat_id=m.chat_id) AND ''' + freshness + ''')))
                 ORDER BY priority DESC,retry_at,created_at LIMIT %s''', (min(limit,1024),)).fetchall()
 
@@ -349,6 +351,11 @@ class Store:
                 retry_at=now()+(%s * interval '1 second') WHERE hash=ANY(%s)''', (reason[:160],delay,list(hashes)))
 
     @staticmethod
+    def whatsapp_consent_freshness():
+        cutoff = time.time() - 60
+        return f"EXISTS(SELECT 1 FROM memory_meta WHERE key='whatsapp_consent_refreshed_at' AND CAST(value AS double precision)>{cutoff})"
+
+    @staticmethod
     def telegram_consent_freshness():
         # Successful source synchronization grants a 60-second lease. A failed
         # worker cannot leave group approval valid indefinitely.
@@ -358,7 +365,7 @@ class Store:
     def filters(self, source=None, chat=None, after=None, before=None, sender=None, alias='m'):
         if source is not None and source not in SOURCES:
             raise ValueError('source must be whatsapp or telegram')
-        clauses = [f"({alias}.source!='whatsapp' OR {alias}.chat_id NOT LIKE '%%@g.us' OR EXISTS(SELECT 1 FROM group_monitoring_consent gc WHERE gc.chat_jid={alias}.chat_id))"]
+        clauses = [f"({alias}.source!='whatsapp' OR {alias}.chat_id NOT LIKE '%%@g.us' OR EXISTS(SELECT 1 FROM group_monitoring_consent gc WHERE gc.chat_jid={alias}.chat_id) AND {self.whatsapp_consent_freshness()})"]
         clauses.append(f"({alias}.source!='telegram' OR {alias}.chat_id NOT LIKE '-%%' OR (EXISTS(SELECT 1 FROM telegram_monitoring_allowed tc WHERE tc.chat_id={alias}.chat_id) AND {self.telegram_consent_freshness()}))")
         values = []
         for key, value, op in [('source',source,'='),('chat_id',chat,'='),('timestamp',after,'>='),('timestamp',before,'<='),('sender',sender,'=')]:

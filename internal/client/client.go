@@ -43,18 +43,27 @@ type Config struct {
 
 // Client wraps a whatsmeow.Client together with the message cache and logger.
 type Client struct {
-	wa               *whatsmeow.Client
-	store            *store.Store
-	log              waLog.Logger
-	handlerID        uint32
-	handlerInstalled bool
-	allowedMediaRoot string
-	redactor         *security.Redactor
-	limiter          *ratelimit.Limiter
-	health           health
-	recoveryMu       sync.Mutex
-	lastRecovery     time.Time
-	captureDownload  func(context.Context, string, string, string) DownloadResult
+	wa                   *whatsmeow.Client
+	store                *store.Store
+	log                  waLog.Logger
+	handlerID            uint32
+	handlerInstalled     bool
+	allowedMediaRoot     string
+	redactor             *security.Redactor
+	limiter              *ratelimit.Limiter
+	health               health
+	recoveryMu           sync.Mutex
+	monitoringMu         sync.Mutex
+	monitoringStateMu    sync.Mutex
+	monitoringGeneration uint64
+	monitoringOnce       sync.Once
+	schedulerOnce        sync.Once
+	schedulerCancel      context.CancelFunc
+	schedulerDone        chan struct{}
+	sendMu               sync.Mutex
+	lastRecovery         time.Time
+	scheduledSend        func(context.Context, string, string) SendResult
+	captureDownload      func(context.Context, string, string, string) DownloadResult
 	// Test seams for view-once recovery: connectivity check and the peer request send.
 	online      func() bool
 	peerRequest func(ctx context.Context, chat, participant types.JID, id string) (whatsmeow.SendResponse, error)
@@ -149,14 +158,20 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		return nil, errors.New("failed to create whatsmeow client")
 	}
 
-	return &Client{
+	all, unknown, budgetErr := cfg.Store.SendBudget()
+	if budgetErr != nil {
+		return nil, fmt.Errorf("restore send budget: %w", budgetErr)
+	}
+	limiter.RestoreSends(all, unknown)
+	c := &Client{
 		wa:               wa,
 		store:            cfg.Store,
 		log:              logger,
 		allowedMediaRoot: cfg.AllowedMediaRoot,
 		redactor:         redactor,
 		limiter:          limiter,
-	}, nil
+	}
+	return c, nil
 }
 
 // ValidateMediaPath is a bound convenience wrapper around

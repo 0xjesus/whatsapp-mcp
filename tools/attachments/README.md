@@ -64,9 +64,9 @@ El presupuesto predeterminado es US$10 por mes UTC, separado del gasto de embedd
 
 Tarifas usadas para este modelo: US$0.75 por millón de tokens de entrada y US$4.50 por millón de salida. Son una estimación del consumo de la API, no una factura; consulta las [tarifas oficiales](https://developers.openai.com/api/docs/models/gpt-5.4-mini). Los resultados limitados por la salida del modelo se identifican como parciales.
 
-## Grupos: autorización explícita
+## Grupos: autorización individual o regla por tamaño
 
-Los grupos están desactivados por defecto. Pertenecer a un grupo, recibir mensajes o pedir un resumen no activa su monitoreo. El administrador de esta instalación registra una autorización explícita para cada grupo; esta acción no acredita por sí sola consentimiento de todos sus participantes.
+Sin configuración, los grupos están desactivados. Puedes autorizar cada grupo o activar la regla automática de hasta 10 integrantes. Pertenecer a un grupo, recibir mensajes o pedir un resumen no cambia la configuración. El administrador de esta instalación registra una autorización explícita para cada grupo; esta acción no acredita por sí sola consentimiento de todos sus participantes.
 
 ```bash
 : "${GROUP_JID:?Define el identificador exacto del grupo que autorizas}"
@@ -77,6 +77,8 @@ python -m tools.attachments.consent revoke --group "$GROUP_JID" --evidence 'Auto
 ```
 
 La autorización afecta recepción automática, sincronización histórica, transcripción, análisis de adjuntos e indexación. La revocación bloquea nueva captura y procesamiento, y el siguiente ciclo del índice bloquea las búsquedas del grupo. Una limpieza por lotes retira sus mensajes del índice y elimina los embeddings que ya no estén asociados a otro mensaje. El historial bruto que ya existía en el almacén de WhatsApp se conserva; la revocación no borra conversaciones en el teléfono. No concede acceso retroactivo a mensajes que WhatsApp ya no entregue.
+
+Para habilitar la regla automática, ejecuta `python -m tools.attachments.consent auto-enable`; `auto-disable` la apaga e `inventory` muestra los grupos y sus conteos. El servidor recupera metadatos de todos los grupos unidos al conectarse y cada cinco minutos. Sólo autoriza automáticamente conteos conocidos de 1 a 10; una decisión manual `allow` o `revoke` prevalece. Los eventos de membresía invalidan permisos automáticos hasta verificar de nuevo el conteo. Si no se renueva la información, el permiso automático caduca a los 15 minutos; el índice tiene además una vigencia máxima de 60 segundos sin sincronización de permisos. Recuperar metadatos no garantiza que WhatsApp vuelva a entregar todos los mensajes antiguos.
 
 Las decisiones quedan registradas localmente. No publiques esa base de datos ni las evidencias de consentimiento.
 

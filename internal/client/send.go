@@ -21,9 +21,12 @@ import (
 
 // SendResult is the public return value from Send/SendMediaWithOptions.
 type SendResult struct {
-	Success bool
-	Message string
-	ID      string
+	Success       bool
+	Message       string
+	ID            string
+	BeforeNetwork bool          `json:"-"`
+	RetryAfter    time.Duration `json:"-"`
+	FailureKind   string        `json:"-"`
 }
 
 // SendMediaOptions bundles the inputs to SendMediaWithOptions so callers can
@@ -47,13 +50,15 @@ func (c *Client) SendMediaWithOptions(ctx context.Context, opts SendMediaOptions
 
 // send is the unified implementation shared by Send and SendMediaWithOptions.
 func (c *Client) send(ctx context.Context, recipient, message, mediaPath string, viewOnce bool) SendResult {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
 	if !c.wa.IsConnected() {
-		return SendResult{Success: false, Message: "Not connected to WhatsApp"}
+		return SendResult{Success: false, BeforeNetwork: true, FailureKind: "offline", RetryAfter: time.Minute, Message: "Not connected to WhatsApp"}
 	}
 
 	recipientJID, err := parseRecipient(recipient)
 	if err != nil {
-		return SendResult{Success: false, Message: err.Error()}
+		return SendResult{Success: false, BeforeNetwork: true, Message: err.Error()}
 	}
 
 	// Daemon-side rate limit — defense-in-depth against a client (or the LLM
@@ -64,7 +69,7 @@ func (c *Client) send(ctx context.Context, recipient, message, mediaPath string,
 	isContact := c.IsKnownContact(recipientJID)
 	if gerr := c.sendGate(isContact); gerr != nil {
 		c.log.Warnf("send to %s refused by health gate: %v", c.redactor.JID(recipientJID.String()), gerr)
-		return SendResult{Success: false, Message: gerr.Error()}
+		return SendResult{Success: false, BeforeNetwork: true, Message: gerr.Error()}
 	}
 	if c.limiter != nil {
 		if ratelimit.BypassFromContext(ctx) {
@@ -72,13 +77,18 @@ func (c *Client) send(ctx context.Context, recipient, message, mediaPath string,
 		} else {
 			if d := c.limiter.AllowSend(isContact); !d.Allowed {
 				c.log.Warnf("Rate limited: send to %s denied (%s); retry in %s", c.redactor.JID(recipientJID.String()), d.Reason, d.RetryAfter.Round(time.Second))
-				return SendResult{Success: false, Message: fmt.Sprintf(
+				return SendResult{Success: false, BeforeNetwork: true, FailureKind: "rate_limit", RetryAfter: d.RetryAfter, Message: fmt.Sprintf(
 					"rate limited: %s — retry in %s (set the X-Rate-Limit-Override header to bypass; see the daemon rate-limit docs)",
 					d.Reason, d.RetryAfter.Round(time.Second))}
 			}
 		}
 	}
 
+	if c.limiter != nil && !ratelimit.BypassFromContext(ctx) && c.store != nil {
+		if err := c.store.RecordSendBudget(isContact); err != nil {
+			return SendResult{BeforeNetwork: true, Message: "cannot persist send safety budget"}
+		}
+	}
 	// Detect disappearing timer for group chats; direct chats default to 0.
 	msg := &waProto.Message{
 		MessageContextInfo: c.ephemeralContextInfo(ctx, recipientJID),
@@ -86,13 +96,24 @@ func (c *Client) send(ctx context.Context, recipient, message, mediaPath string,
 
 	if mediaPath != "" {
 		if err := c.attachMedia(ctx, msg, mediaPath, message, viewOnce); err != nil {
-			return SendResult{Success: false, Message: err.Error()}
+			return SendResult{Success: false, BeforeNetwork: true, Message: err.Error()}
 		}
 	} else {
 		msg.Conversation = proto.String(message)
 	}
 
 	c.humanizeBeforeSend(ctx, recipientJID, len(message), msg.AudioMessage != nil)
+	if ctx.Err() != nil {
+		return SendResult{BeforeNetwork: true, FailureKind: "offline", RetryAfter: time.Minute, Message: "send context cancelled"}
+	}
+	if hook, ok := ctx.Value(scheduledDispatchKey{}).(func() error); ok {
+		if err := c.sendGate(c.IsKnownContact(recipientJID)); err != nil {
+			return SendResult{BeforeNetwork: true, Message: "send safety changed before scheduled dispatch"}
+		}
+		if err := hook(); err != nil {
+			return SendResult{BeforeNetwork: true, Message: "scheduled dispatch state changed"}
+		}
+	}
 	resp, err := c.wa.SendMessage(ctx, recipientJID, msg)
 	if err != nil {
 		c.noteSendError(err)

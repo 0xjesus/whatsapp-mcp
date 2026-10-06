@@ -9,10 +9,8 @@
 // client, with an explicit, loudly-logged operator override for the rare
 // legitimate burst.
 //
-// The limiter is a pure in-memory sliding-window counter with an injectable
-// clock. State is intentionally NOT persisted: a daemon restart resets the
-// windows, which is acceptable because a restart is a manual operator action,
-// not something the model can trigger to bypass the guard.
+// The limiter uses sliding windows with an injectable clock. The client
+// persists admitted send budgets and restores them before serving tools.
 package ratelimit
 
 import (
@@ -186,4 +184,18 @@ func WithBypass(ctx context.Context) context.Context {
 func BypassFromContext(ctx context.Context) bool {
 	v, _ := ctx.Value(bypassKey{}).(bool)
 	return v
+}
+
+// RestoreSends restores the durable trailing-hour send ledger before serving tools.
+func (l *Limiter) RestoreSends(all, unknown []time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	cutoff := l.clock().Add(-time.Hour)
+	l.sends = pruneBefore(append(l.sends, all...), cutoff)
+	l.nonContactSends = pruneBefore(append(l.nonContactSends, unknown...), cutoff)
+	for _, at := range l.sends {
+		if at.After(l.lastSend) {
+			l.lastSend = at
+		}
+	}
 }

@@ -261,6 +261,8 @@ func (c *Client) mutationGate(recipient string) error {
 // sendFeatureMessage applies the same account protection and send budget to
 // polls, votes, cards, replies, reactions, edits and revokes as ordinary messages.
 func (c *Client) sendFeatureMessage(ctx context.Context, recipient types.JID, msg *waProto.Message) (whatsmeow.SendResponse, error) {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
 	if err := c.mutationGate(recipient.String()); err != nil {
 		return whatsmeow.SendResponse{}, err
 	}
@@ -268,6 +270,12 @@ func (c *Client) sendFeatureMessage(ctx context.Context, recipient types.JID, ms
 		known := recipient.Server == types.GroupServer || (c.store != nil && c.IsKnownContact(recipient))
 		if d := c.limiter.AllowSend(known); !d.Allowed {
 			return whatsmeow.SendResponse{}, fmt.Errorf("rate limited: %s — retry in %s (set the X-Rate-Limit-Override header to bypass)", d.Reason, d.RetryAfter.Round(time.Second))
+		}
+	}
+	if c.limiter != nil && !ratelimit.BypassFromContext(ctx) && c.store != nil {
+		known := recipient.Server == types.GroupServer || c.IsKnownContact(recipient)
+		if err := c.store.RecordSendBudget(known); err != nil {
+			return whatsmeow.SendResponse{}, fmt.Errorf("cannot persist send safety budget")
 		}
 	}
 	resp, err := c.wa.SendMessage(ctx, recipient, msg)

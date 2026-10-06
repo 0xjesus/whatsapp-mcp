@@ -239,3 +239,16 @@ func TestConcurrentSends(t *testing.T) {
 		t.Fatalf("expected exactly 1 send admitted at a frozen clock, got %d", allowed)
 	}
 }
+
+func TestRestoreSendBudgetPreservesCooldownAndHourlyCap(t *testing.T) {
+	l, _ := newTestLimiter(t, testConfig())
+	now := l.clock()
+	l.RestoreSends([]time.Time{now.Add(-time.Minute), now.Add(-30 * time.Second), now.Add(-5 * time.Second)}, []time.Time{now.Add(-5 * time.Second)})
+	if d := l.AllowSend(true); d.Allowed || d.RetryAfter < 5*time.Second {
+		t.Fatal("restored cooldown", d)
+	}
+	l.lastSend = now.Add(-time.Minute)
+	if d := l.AllowSend(true); d.Allowed || d.Reason != "hourly send cap reached" {
+		t.Fatal("restored hourly cap", d)
+	}
+}

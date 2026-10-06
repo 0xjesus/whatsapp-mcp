@@ -23,3 +23,15 @@ class ConsentTests(unittest.TestCase):
             db.execute("INSERT INTO poll_votes VALUES('123-456@g.us')")
             self.assertEqual(db.execute('SELECT COUNT(*) FROM messages').fetchone()[0],1)
             self.assertEqual(db.execute('SELECT COUNT(*) FROM poll_votes').fetchone()[0],0)
+
+    def test_expired_auto_grant_denies_worker_and_atomic_writes(self):
+        from tools.attachments.worker import allowed
+        with sqlite3.connect(':memory:') as db:
+            db.executescript('CREATE TABLE messages(id TEXT,chat_jid TEXT);')
+            set_consent(db,'123@g.us',True,'manual',True)
+            db.execute("UPDATE group_monitoring_consent SET evidence='auto:max-members:10',updated_at='2000-01-01T00:00:00Z'")
+            self.assertFalse(allowed(db,'123@g.us'))
+            db.execute("INSERT INTO messages VALUES('expired','123@g.us')")
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM messages').fetchone()[0],0)
+            with self.assertRaises(ValueError):
+                set_consent(db,'123@g.us',True,'auto:max-members:10',True)

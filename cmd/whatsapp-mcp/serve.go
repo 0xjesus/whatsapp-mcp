@@ -97,6 +97,11 @@ func runServe(storeDir string, redactor *security.Redactor, args []string) int {
 		return 1
 	}
 
+	if err := c.StartScheduler(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "start scheduler: %v\n", err)
+		return 1
+	}
+	defer c.StopScheduler()
 	drv := newProductionDriver(c)
 
 	// The daemon owns the pair cache, so build it first, then hand the cache

@@ -10,6 +10,10 @@ import (
 // drifts.
 var expectedToolNames = []string{
 	"block_contact",
+	"cancel_scheduled_message",
+	"list_scheduled_messages",
+	"reschedule_message",
+	"schedule_message",
 	"create_group",
 	"delete_message",
 	"download_media",
@@ -121,7 +125,7 @@ func TestNewServer_RegistersAllTools(t *testing.T) {
 
 func TestNewServer_ToolCount(t *testing.T) {
 	s := NewServer(nil, nil)
-	const want = 47
+	const want = 51
 	if got := len(s.MCP().ListTools()); got != want {
 		t.Errorf("tool count = %d, want %d", got, want)
 	}

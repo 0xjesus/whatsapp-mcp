@@ -364,3 +364,24 @@ class TelegramConsentTests(unittest.TestCase):
         self.assertEqual(source.backfill_page(0, 100), [])
         source.install_capture()
         self.assertEqual(source.telegram_channels(), [])
+
+class ConsentHeartbeatTests(unittest.TestCase):
+    setUp = SourceTests.setUp
+    source = SourceTests.source
+    write = SourceTests.write
+    insert = SourceTests.insert
+
+    def test_fresh_automatic_heartbeats_do_not_requeue_messages(self):
+        for kind, chat, column in [('whatsapp', '123@g.us', 'chat_jid'), ('telegram', -1, 'chat_id')]:
+            with self.subTest(kind=kind):
+                source = self.source(kind)
+                self.insert(source, chat=chat)
+                source.install_capture()
+                with sqlite3.connect(source.path) as db:
+                    db.execute("INSERT INTO group_monitoring_consent VALUES(?,1,'auto:max-members:10',datetime('now'))", (chat,))
+                    before = db.execute('SELECT count(*) FROM memory_changes').fetchone()[0]
+                    db.execute("UPDATE group_monitoring_consent SET updated_at=datetime('now','+1 second')")
+                    self.assertEqual(db.execute('SELECT count(*) FROM memory_changes').fetchone()[0], before)
+                    db.execute("UPDATE group_monitoring_consent SET updated_at='2000-01-01T00:00:00Z'")
+                    db.execute("UPDATE group_monitoring_consent SET updated_at=datetime('now')")
+                    self.assertEqual(db.execute('SELECT count(*) FROM memory_changes').fetchone()[0], before + 1)

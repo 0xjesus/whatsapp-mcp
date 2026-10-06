@@ -17,13 +17,14 @@ Parte de [Sealjay/mcp-whatsapp](https://github.com/Sealjay/mcp-whatsapp), basado
 
 - **Buscar por lo que recuerdas.** Encuentra conversaciones por su significado, aunque no recuerdes las palabras exactas. Combina búsqueda semántica y búsqueda de texto.
 - **Buscar dentro de imágenes y documentos.** Extrae texto de imágenes, PDF, Word, Excel y presentaciones, y lo incorpora al índice. Puede interpretar imágenes y documentos con OpenAI, conservar el texto original y controlar el gasto con un presupuesto mensual y caché. También admite visión local; los análisis incompletos quedan identificados.
-- **Elegir qué grupos monitorear.** Los grupos están desactivados por defecto. Cada uno necesita autorización explícita, que puedes revocar.
+- **Elegir qué grupos monitorear.** Autoriza grupos individualmente o activa la regla automática de hasta 10 integrantes. Los grupos más grandes o de tamaño desconocido quedan apagados; tus decisiones manuales tienen prioridad.
 - **Buscar dentro de notas de voz.** Transcribe los audios disponibles para que puedas consultar lo que se dijo. La transcripción se ejecuta localmente.
 - **Revisar videos desde el asistente.** Transcribe su audio y entrega hasta seis fotogramas para inspeccionar el contenido visual. Los fotogramas son una muestra del clip.
 - **Recordar reacciones recibidas.** Guarda quién reaccionó a un mensaje y refleja si cambió o quitó el emoji.
 - **Mantener el historial actualizado.** Incorpora ediciones y eliminaciones recibidas. Evita que una sincronización antigua vuelva a introducir mensajes revocados.
 - **Registrar más tipos de contenido.** Guarda stickers, ubicaciones y contactos. Si llega un tipo todavía no compatible, deja un aviso en el historial.
 - **Solicitar más historial antiguo.** Al vincular la cuenta, puede pedir una ventana histórica mayor. La recuperación depende de lo que WhatsApp entregue.
+- **Programar mensajes para después.** Guarda envíos con fecha y zona horaria, consulta la cola, cancela o reprograma. La cola persiste tras reinicios y respeta los límites de envío.
 - **Aplicar controles adicionales de envío.** Espacia mensajes, aplica límites y frena acciones cuando detecta restricciones de la cuenta. Estos controles no garantizan evitar bloqueos.
 - **Mostrar cuánto falta por procesar.** Permite consultar la cobertura del índice, los mensajes pendientes de preparar para búsquedas y estadísticas del historial disponible.
 
@@ -176,3 +177,11 @@ Los trabajadores de historial y transcripción tienen sus propias pruebas, descr
 ## Licencia
 
 [MIT](LICENSE). Se conservan los créditos de [Sealjay/mcp-whatsapp](https://github.com/Sealjay/mcp-whatsapp) y [lharries/whatsapp-mcp](https://github.com/lharries/whatsapp-mcp).
+
+## Mensajes programados
+
+Las herramientas `schedule_message`, `list_scheduled_messages`, `cancel_scheduled_message` y `reschedule_message` están incluidas en el servidor. Para programar, indica `chat_jid`, `text` y `send_at` con fecha RFC3339 y zona horaria; por ejemplo `2026-12-01T10:00:00-06:00`. Puedes añadir `idempotency_key` para que repetir la misma solicitud no duplique el encargo, y `expires_at` para limitar cuánto puede retrasarse. Las operaciones posteriores usan el `job_id` devuelto.
+
+La cola privada usa SQLite y un solo trabajador, con consultas indexadas y un máximo de 1,000 trabajos activos, incluidos los de resultado incierto. Limpia por lotes el historial terminal de más de siete días; la deduplicación por clave dura mientras se conserve el registro. No crea un proceso ni un temporizador por mensaje. Los envíos programados y los inmediatos comparten controles de ritmo, contactos conocidos y restricciones de cuenta; los contadores de envío se conservan al reiniciar.
+
+Se admiten textos de hasta 16 KiB y fechas dentro de 366 días. El vencimiento predeterminado es 24 horas después de la fecha solicitada. El servicio debe estar encendido y conectado; los límites pueden retrasar la entrega. Cancelar y reprogramar sólo funciona con trabajos pendientes. Si el resultado de un envío queda incierto, se conserva para revisión y no se reenvía a ciegas. Estos controles no garantizan evitar restricciones de WhatsApp.
