@@ -114,14 +114,7 @@ class Source:
                             BEFORE {event} ON {table} WHEN new.{chat_column} LIKE '%@g.us'
                             AND NOT EXISTS(SELECT 1 FROM group_monitoring_consent g WHERE g.chat_jid=new.{chat_column} AND g.allowed=1 AND (g.evidence NOT LIKE 'auto:max-members:%' OR CAST(strftime('%s',g.updated_at) AS INTEGER)>CAST(strftime('%s','now') AS INTEGER)-900))
                             BEGIN SELECT RAISE(IGNORE); END""")
-                for event,prefix in [('INSERT','new'),('UPDATE','new'),('DELETE','old')]:
-                    condition = "" if event != 'UPDATE' else "WHEN old.allowed!=new.allowed OR old.evidence!=new.evidence OR (new.allowed=1 AND new.evidence LIKE 'auto:max-members:%' AND (CAST(strftime('%s',old.updated_at) AS INTEGER) IS NULL OR CAST(strftime('%s',old.updated_at) AS INTEGER)<=CAST(strftime('%s','now') AS INTEGER)-900))"
-                    c.execute(f"DROP TRIGGER IF EXISTS memory_consent_{event.lower()}")
-                    c.execute(f"""CREATE TRIGGER IF NOT EXISTS memory_consent_{event.lower()}
-                        AFTER {event} ON group_monitoring_consent {condition} BEGIN
-                        INSERT INTO memory_changes(chat_id,message_id,op)
-                        SELECT chat_jid,id,'upsert' FROM messages WHERE chat_jid={prefix}.chat_jid;
-                        END""")
+                self._install_group_rescan(c, 'chat_jid', 'memory_consent')
             if self.kind == 'telegram':
                 c.execute("""CREATE TABLE IF NOT EXISTS group_monitoring_consent(
                     chat_id INTEGER PRIMARY KEY,allowed INTEGER NOT NULL DEFAULT 0,
@@ -137,14 +130,7 @@ class Source:
                             BEFORE {event} ON {table} WHEN NOT (new.chat_id>0{channel}
                             OR EXISTS(SELECT 1 FROM group_monitoring_consent g WHERE g.chat_id=new.chat_id AND g.allowed=1 AND (g.evidence NOT LIKE 'auto:max-members:%' OR CAST(strftime('%s',g.updated_at) AS INTEGER)>CAST(strftime('%s','now') AS INTEGER)-900)))
                             BEGIN SELECT RAISE(IGNORE); END""")
-                for event,prefix in [('INSERT','new'),('UPDATE','new'),('DELETE','old')]:
-                    condition = "" if event != 'UPDATE' else "WHEN old.allowed!=new.allowed OR old.evidence!=new.evidence OR (new.allowed=1 AND new.evidence LIKE 'auto:max-members:%' AND (CAST(strftime('%s',old.updated_at) AS INTEGER) IS NULL OR CAST(strftime('%s',old.updated_at) AS INTEGER)<=CAST(strftime('%s','now') AS INTEGER)-900))"
-                    c.execute(f"DROP TRIGGER IF EXISTS memory_telegram_consent_{event.lower()}")
-                    c.execute(f"""CREATE TRIGGER IF NOT EXISTS memory_telegram_consent_{event.lower()}
-                        AFTER {event} ON group_monitoring_consent {condition} BEGIN
-                        INSERT INTO memory_changes(chat_id,message_id,op)
-                        SELECT CAST(chat_id AS TEXT),CAST(id AS TEXT),'upsert' FROM messages WHERE chat_id={prefix}.chat_id;
-                        END""")
+                self._install_group_rescan(c, 'chat_id', 'memory_telegram_consent')
                 if typed:
                     for event in ('INSERT','UPDATE','DELETE'):
                         prefix = 'old' if event == 'DELETE' else 'new'
@@ -282,10 +268,69 @@ class Source:
                             (str(chat_id), str(message_id))).fetchone()
             return self._normalize(row) if row else None
 
+    def _install_group_rescan(self, c, chat_column, prefix):
+        c.execute("""CREATE TABLE IF NOT EXISTS memory_group_rescan(
+            chat_id TEXT PRIMARY KEY,cursor TEXT)""")
+        # Telegram already has (chat_id,id); reuse it rather than indexing its cache again.
+        indexes = [row['name'] for row in c.execute('PRAGMA index_list(messages)')]
+        indexed = any([r['name'] for r in c.execute('PRAGMA index_info("'+name.replace('"','""')+'")')][:2]
+                      == [chat_column, 'id'] for name in indexes)
+        if not indexed:
+            c.execute(f'CREATE INDEX IF NOT EXISTS memory_group_rescan_messages ON messages({chat_column},id)')
+        fresh = "(new.evidence NOT LIKE 'auto:max-members:%' OR CAST(strftime('%s',new.updated_at) AS INTEGER)>CAST(strftime('%s','now') AS INTEGER)-900)"
+        renewed = "(old.evidence LIKE 'auto:max-members:%' AND (CAST(strftime('%s',old.updated_at) AS INTEGER) IS NULL OR CAST(strftime('%s',old.updated_at) AS INTEGER)<=CAST(strftime('%s','now') AS INTEGER)-900))"
+        for event in ('INSERT','UPDATE','DELETE'):
+            c.execute(f'DROP TRIGGER IF EXISTS {prefix}_{event.lower()}')
+            if event == 'DELETE':
+                c.execute(f"""CREATE TRIGGER {prefix}_delete AFTER DELETE ON group_monitoring_consent BEGIN
+                    DELETE FROM memory_group_rescan WHERE chat_id=CAST(old.{chat_column} AS TEXT); END""")
+                continue
+            transition = '' if event == 'INSERT' else f' AND (old.allowed!=1 OR old.evidence IS NOT new.evidence OR {renewed})'
+            c.execute(f"""CREATE TRIGGER {prefix}_{event.lower()} AFTER {event} ON group_monitoring_consent
+                WHEN new.allowed=1 AND {fresh}{transition} BEGIN
+                INSERT INTO memory_group_rescan(chat_id,cursor) VALUES(CAST(new.{chat_column} AS TEXT),NULL)
+                ON CONFLICT(chat_id) DO UPDATE SET cursor=NULL; END""")
+
+    def _drain_group_rescan(self, c, capacity):
+        if capacity <= 0 or not self._has(c, 'memory_group_rescan'):
+            return
+        pending = c.execute('SELECT chat_id,cursor FROM memory_group_rescan ORDER BY rowid LIMIT 1').fetchone()
+        if pending is None:
+            return
+        column = self.fields['chat']
+        peer = int(pending['chat_id']) if self.kind == 'telegram' else pending['chat_id']
+        allowed = c.execute(f"""SELECT 1 FROM group_monitoring_consent WHERE {column}=? AND allowed=1
+            AND (evidence NOT LIKE 'auto:max-members:%' OR CAST(strftime('%s',updated_at) AS INTEGER)>CAST(strftime('%s','now') AS INTEGER)-900)""", (peer,)).fetchone()
+        if not allowed:
+            c.execute('DELETE FROM memory_group_rescan WHERE chat_id=?', (pending['chat_id'],))
+            return
+        predicate = f'{column}=?'
+        args = [peer]
+        if pending['cursor'] is not None:
+            predicate += ' AND id>?'
+            args.append(int(pending['cursor']) if self.kind == 'telegram' else pending['cursor'])
+        rows = c.execute(f'SELECT id FROM messages WHERE {predicate} ORDER BY id LIMIT ?',
+                         (*args, capacity + 1)).fetchall()
+        batch = rows[:capacity]
+        c.executemany("INSERT INTO memory_changes(chat_id,message_id,op) VALUES(?,?,'upsert')",
+                      [(pending['chat_id'], str(row['id'])) for row in batch])
+        if len(rows) <= capacity:
+            c.execute('DELETE FROM memory_group_rescan WHERE chat_id=?', (pending['chat_id'],))
+        else:
+            c.execute('UPDATE memory_group_rescan SET cursor=? WHERE chat_id=?',
+                      (str(batch[-1]['id']), pending['chat_id']))
+
     def changes(self, after_seq, limit):
-        with self._db() as c:
-            rows = c.execute('''SELECT seq,chat_id,message_id,op,event_token FROM memory_changes
-                WHERE seq>? ORDER BY seq LIMIT ?''', (int(after_seq), _limit(limit))).fetchall()
+        limit = _limit(limit)
+        with self._db(write=True) as c:
+            rows = c.execute("""SELECT seq,chat_id,message_id,op,event_token FROM memory_changes
+                WHERE seq>? ORDER BY seq LIMIT ?""", (int(after_seq), limit)).fetchall()
+            # Existing edits/deletes have priority. Never outrun downstream consumption.
+            capacity = min(200, limit - len(rows))
+            if capacity > 0:
+                self._drain_group_rescan(c, capacity)
+                rows = c.execute("""SELECT seq,chat_id,message_id,op,event_token FROM memory_changes
+                    WHERE seq>? ORDER BY seq LIMIT ?""", (int(after_seq), limit)).fetchall()
             return [dict(row) for row in rows]
 
     def identity(self):

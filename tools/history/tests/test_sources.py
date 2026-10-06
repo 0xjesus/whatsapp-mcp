@@ -266,7 +266,7 @@ class SourceTests(unittest.TestCase):
         cursor = source.watermark()
         self.write(source, "UPDATE group_monitoring_consent SET allowed=0")
         self.assertIsNone(source.get('123@g.us', 'same'))
-        self.assertEqual(source.changes(cursor, 20)[0]['chat_id'], '123@g.us')
+        self.assertEqual(source.changes(cursor, 20), [])
 
     def test_missing_source_is_never_created(self):
         self.assertIsNotNone(Source, 'Source adapter has not been implemented')
@@ -342,7 +342,7 @@ class TelegramConsentTests(unittest.TestCase):
         watermark = source.watermark()
         self.write(source, "UPDATE group_monitoring_consent SET allowed=0 WHERE chat_id=-1")
         self.assertIsNone(source.get('-1', '10'))
-        self.assertEqual(source.changes(watermark, 100)[0]['chat_id'], '-1')
+        self.assertEqual(source.changes(watermark, 100), [])
         self.insert(source, chat=-1, mid=11)
         self.write(source, "INSERT INTO transcripts(chat_id,id,text,status) VALUES(-1,10,'secret','done')")
         with sqlite3.connect(source.path) as c:
@@ -384,4 +384,59 @@ class ConsentHeartbeatTests(unittest.TestCase):
                     self.assertEqual(db.execute('SELECT count(*) FROM memory_changes').fetchone()[0], before)
                     db.execute("UPDATE group_monitoring_consent SET updated_at='2000-01-01T00:00:00Z'")
                     db.execute("UPDATE group_monitoring_consent SET updated_at=datetime('now')")
-                    self.assertEqual(db.execute('SELECT count(*) FROM memory_changes').fetchone()[0], before + 1)
+                    self.assertEqual(db.execute('SELECT count(*) FROM memory_changes').fetchone()[0], before)
+                    self.assertEqual(db.execute('SELECT count(*) FROM memory_group_rescan').fetchone()[0], 1)
+
+class GroupRescanTests(unittest.TestCase):
+    setUp = SourceTests.setUp
+    source = SourceTests.source
+    write = SourceTests.write
+    insert = SourceTests.insert
+
+    def test_approval_is_constant_size_and_rescan_is_bounded_durable(self):
+        for kind, chat in [('whatsapp', '123@g.us'), ('telegram', -1)]:
+            with self.subTest(kind=kind):
+                source = self.source(kind)
+                for mid in range(1, 451):
+                    self.insert(source, chat=chat, mid=str(mid) if kind == 'whatsapp' else mid)
+                source.install_capture()
+                with sqlite3.connect(source.path) as db:
+                    db.execute("INSERT INTO group_monitoring_consent VALUES(?,0,'auto:max-members:10',datetime('now'))", (chat,))
+                    self.assertEqual(db.execute('SELECT count(*) FROM memory_group_rescan').fetchone()[0], 0)
+                    self.assertEqual(db.execute('SELECT count(*) FROM memory_changes').fetchone()[0], 0)
+                    db.execute('UPDATE group_monitoring_consent SET allowed=1')
+                    self.assertEqual(db.execute('SELECT count(*) FROM memory_group_rescan').fetchone()[0], 1)
+                    self.assertEqual(db.execute('SELECT count(*) FROM memory_changes').fetchone()[0], 0)
+                batch = source.changes(0, 1000)
+                self.assertEqual(len(batch), 200)
+                seen = {r['message_id'] for r in batch}
+                cursor = batch[-1]['seq']
+                # Restart retains the per-group keyset cursor and never resets it.
+                source = Source(kind, source.path)
+                source.install_capture()
+                for expected in (200, 50):
+                    batch = source.changes(cursor, 1000)
+                    self.assertEqual(len(batch), expected)
+                    self.assertFalse(seen & {r['message_id'] for r in batch})
+                    seen.update(r['message_id'] for r in batch)
+                    cursor = batch[-1]['seq']
+                self.assertEqual(len(seen), 450)
+                self.assertEqual(source.changes(cursor, 1000), [])
+                with sqlite3.connect(source.path) as db:
+                    self.assertEqual(db.execute('SELECT count(*) FROM memory_group_rescan').fetchone()[0], 0)
+
+    def test_revoked_or_expired_rescans_are_dropped_without_message_reads(self):
+        for kind, chat in [('whatsapp', '123@g.us'), ('telegram', -1)]:
+            with self.subTest(kind=kind):
+                source = self.source(kind)
+                self.insert(source, chat=chat)
+                source.install_capture()
+                with sqlite3.connect(source.path) as db:
+                    db.execute("INSERT INTO group_monitoring_consent VALUES(?,1,'auto:max-members:10',datetime('now'))", (chat,))
+                    db.execute("UPDATE group_monitoring_consent SET updated_at='2000-01-01T00:00:00Z'")
+                self.assertEqual(source.changes(0, 100), [])
+                with sqlite3.connect(source.path) as db:
+                    self.assertEqual(db.execute('SELECT count(*) FROM memory_group_rescan').fetchone()[0], 0)
+                    db.execute("UPDATE group_monitoring_consent SET updated_at=datetime('now')")
+                    db.execute('UPDATE group_monitoring_consent SET allowed=0')
+                self.assertEqual(source.changes(0, 100), [])
