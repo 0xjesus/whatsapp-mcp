@@ -15,6 +15,8 @@ class CoverageQueryTests(unittest.TestCase):
         db.row_factory = lambda cursor, row: dict(zip([c[0] for c in cursor.description], row))
         db.executescript('''CREATE TABLE messages(id INTEGER,source TEXT,timestamp INTEGER,chat_id TEXT DEFAULT 'direct');
             CREATE TABLE group_monitoring_consent(chat_jid TEXT);
+            CREATE TABLE telegram_monitoring_allowed(chat_id TEXT);
+            CREATE TABLE memory_meta(key TEXT,value TEXT);
             CREATE TABLE message_chunks(message_pk INTEGER,ordinal INTEGER,hash TEXT);
             CREATE TABLE embeddings(hash TEXT,embedding TEXT);
             CREATE TABLE source_state(source TEXT,backfill_done BOOLEAN);

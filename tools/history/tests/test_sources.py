@@ -317,3 +317,50 @@ class SourceTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class TelegramConsentTests(unittest.TestCase):
+    setUp = SourceTests.setUp
+    source = SourceTests.source
+    write = SourceTests.write
+    insert = SourceTests.insert
+    def test_telegram_deny_grant_revoke_and_channels(self):
+        source = self.source('telegram')
+        self.write(source, 'ALTER TABLE chats ADD COLUMN type TEXT')
+        self.write(source, "INSERT INTO chats(id,title,type) VALUES(-1,'Group','supergroup'),(-2,'Broadcast','channel')")
+        self.insert(source, chat=-1)
+        self.insert(source, chat=-2)
+        self.insert(source, chat=-3)
+        self.insert(source, chat=1)
+        self.assertEqual({r['chat_id'] for r in source.backfill_page(0, 100)}, {'1','-2'})
+        source.install_capture()
+        self.assertEqual(source.allowed_groups(), [])
+        self.assertEqual(source.telegram_channels(), ['-2'])
+        self.assertIsNone(source.get('-1', '10'))
+        self.write(source, "INSERT INTO group_monitoring_consent VALUES(-1,1,'synthetic approval','now')")
+        self.assertEqual(source.allowed_groups(), ['-1'])
+        self.assertIsNotNone(source.get('-1', '10'))
+        watermark = source.watermark()
+        self.write(source, "UPDATE group_monitoring_consent SET allowed=0 WHERE chat_id=-1")
+        self.assertIsNone(source.get('-1', '10'))
+        self.assertEqual(source.changes(watermark, 100)[0]['chat_id'], '-1')
+        self.insert(source, chat=-1, mid=11)
+        self.write(source, "INSERT INTO transcripts(chat_id,id,text,status) VALUES(-1,10,'secret','done')")
+        with sqlite3.connect(source.path) as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM messages WHERE chat_id=-1 AND id=11').fetchone()[0], 0)
+            self.assertEqual(c.execute('SELECT count(*) FROM transcripts WHERE chat_id=-1').fetchone()[0], 0)
+        self.assertIsNotNone(source.get('-2', '10'))
+        self.assertIsNotNone(source.get('1', '10'))
+        watermark = source.watermark()
+        self.write(source, "UPDATE chats SET title='Renamed broadcast' WHERE id=-2")
+        self.assertEqual(source.watermark(), watermark)
+        self.write(source, "UPDATE chats SET type='supergroup' WHERE id=-2")
+        self.assertGreater(source.watermark(), watermark)
+        self.assertEqual(source.telegram_channels(), [])
+        self.assertIsNone(source.get('-2', '10'))
+
+    def test_telegram_legacy_missing_type_denies_unknown_negative(self):
+        source = self.source('telegram')
+        self.insert(source, chat=-99)
+        self.assertEqual(source.backfill_page(0, 100), [])
+        source.install_capture()
+        self.assertEqual(source.telegram_channels(), [])

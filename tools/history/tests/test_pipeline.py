@@ -94,7 +94,8 @@ class PipelineTests(unittest.TestCase):
         store.lexical.return_value=[dict(id=1,text='synthetic')]
         model=Mock()
         model.embed.side_effect=TimeoutError('synthetic')
-        result=search(store,model,dict(source='telegram',query='synthetic'))
+        with patch('search_data.SearchData.authorized', side_effect=lambda rows, **kwargs: rows):
+            result=search(store,model,dict(source='telegram',query='synthetic'))
         self.assertTrue(result['degraded'])
         self.assertEqual(len(result['results']),1)
         store.semantic.assert_not_called()

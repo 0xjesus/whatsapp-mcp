@@ -63,6 +63,7 @@ class Store:
             db.execute('''
                 CREATE TABLE IF NOT EXISTS memory_meta(key text PRIMARY KEY, value text NOT NULL);
                 CREATE TABLE IF NOT EXISTS group_monitoring_consent(chat_jid text PRIMARY KEY);
+                CREATE TABLE IF NOT EXISTS telegram_monitoring_allowed(chat_id text PRIMARY KEY);
                 CREATE TABLE IF NOT EXISTS source_state(
                     source text PRIMARY KEY, cursor bigint NOT NULL DEFAULT 0,
                     change_seq bigint NOT NULL DEFAULT 0, backfill_done boolean NOT NULL DEFAULT false,
@@ -133,7 +134,7 @@ class Store:
                 ON CONFLICT(source) DO UPDATE SET cursor=0,change_seq=0,backfill_done=false,
                 source_identity=excluded.source_identity,change_token=NULL,source_stats='{}',updated_at=now()''',(source,identity))
 
-    def sync_group_consent(self, groups):
+    def sync_group_consent(self, groups, *, cleanup=True):
         """Publish deny-by-default policy first; clean derived data in bounded batches."""
         groups = sorted(set(groups))
         with self.connection('15s') as db:
@@ -146,6 +147,8 @@ class Store:
                 db.execute("INSERT INTO memory_meta VALUES('group_consent_initialized','1') ON CONFLICT DO NOTHING")
                 for key,value in [('group_consent_cleanup','pending'),('group_orphan_cursor',''),('group_message_cursor','0'),('group_cleanup_phase','messages')]:
                     db.execute('INSERT INTO memory_meta VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET value=excluded.value',(key,value))
+        if not cleanup:
+            return
         # Policy is already committed. Timeout during cleanup cannot restore permission.
         try:
             self.cleanup_group_consent()
@@ -186,6 +189,63 @@ class Store:
                 db.execute("UPDATE memory_meta SET value=%s WHERE key='group_orphan_cursor'",(candidates[-1]['hash'],))
             if len(candidates) < 500:
                 db.execute("UPDATE memory_meta SET value='done' WHERE key='group_consent_cleanup'")
+
+    def sync_telegram_consent(self, allowed_groups, channels, *, cleanup=True):
+        """Publish deny-by-default policy first; clean derived data in bounded batches."""
+        groups = sorted(set(map(str, allowed_groups)) | set(map(str, channels)))
+        with self.connection('15s') as db:
+            current = [r['chat_id'] for r in db.execute('SELECT chat_id FROM telegram_monitoring_allowed ORDER BY chat_id')]
+            initialized = db.execute("SELECT 1 FROM memory_meta WHERE key='telegram_consent_initialized'").fetchone()
+            db.execute("INSERT INTO memory_meta VALUES('telegram_consent_refreshed_at',%s) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(time.time()),))
+            if current != groups or not initialized:
+                db.execute('DELETE FROM telegram_monitoring_allowed')
+                for group in groups:
+                    db.execute('INSERT INTO telegram_monitoring_allowed VALUES(%s)', (group,))
+                db.execute("INSERT INTO memory_meta VALUES('telegram_consent_initialized','1') ON CONFLICT DO NOTHING")
+                for key,value in [('telegram_consent_cleanup','pending'),('telegram_orphan_cursor',''),('telegram_message_cursor','0'),('telegram_cleanup_phase','messages')]:
+                    db.execute('INSERT INTO memory_meta VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET value=excluded.value',(key,value))
+        if not cleanup:
+            return
+        # Policy is already committed. Timeout during cleanup cannot restore permission.
+        try:
+            self.cleanup_telegram_consent()
+        except Exception as error:
+            from psycopg.errors import QueryCanceled
+            if not isinstance(error, QueryCanceled):
+                raise
+
+    def cleanup_telegram_consent(self):
+        """At most 200 messages and 500 historical embedding candidates per cycle."""
+        with self.connection('15s') as db:
+            state = db.execute("SELECT value FROM memory_meta WHERE key='telegram_consent_cleanup'").fetchone()
+            if not state or state['value'] != 'pending':
+                return
+            phase = db.execute("SELECT value FROM memory_meta WHERE key='telegram_cleanup_phase'").fetchone()
+            if not phase or phase['value'] == 'messages':
+                cursor = db.execute("SELECT value FROM memory_meta WHERE key='telegram_message_cursor'").fetchone()
+                # Scan a fixed number of primary keys, including other sources. A
+                # LIMIT on matching denied rows alone would still scan unbounded data.
+                candidates = db.execute('SELECT id FROM messages WHERE id>%s ORDER BY id LIMIT 200',
+                                        (int(cursor['value']) if cursor else 0,)).fetchall()
+                if candidates:
+                    db.execute("""DELETE FROM messages m WHERE m.id=ANY(%s) AND m.source='telegram'
+                        AND m.chat_id LIKE '-%%' AND NOT EXISTS(
+                            SELECT 1 FROM telegram_monitoring_allowed g WHERE g.chat_id=m.chat_id)""",
+                        ([r['id'] for r in candidates],))
+                    db.execute("UPDATE memory_meta SET value=%s WHERE key='telegram_message_cursor'",(str(candidates[-1]['id']),))
+                if len(candidates) == 200:
+                    return
+                db.execute("UPDATE memory_meta SET value='embeddings' WHERE key='telegram_cleanup_phase'")
+            cursor = db.execute("SELECT value FROM memory_meta WHERE key='telegram_orphan_cursor'").fetchone()
+            candidates = db.execute('SELECT hash FROM embeddings WHERE hash>%s ORDER BY hash LIMIT 500',
+                                     (cursor['value'] if cursor else '',)).fetchall()
+            if candidates:
+                db.execute("""DELETE FROM embeddings e WHERE e.hash=ANY(%s)
+                    AND NOT EXISTS(SELECT 1 FROM message_chunks c WHERE c.hash=e.hash)""",
+                    ([r['hash'] for r in candidates],))
+                db.execute("UPDATE memory_meta SET value=%s WHERE key='telegram_orphan_cursor'",(candidates[-1]['hash'],))
+            if len(candidates) < 500:
+                db.execute("UPDATE memory_meta SET value='done' WHERE key='telegram_consent_cleanup'")
 
     def apply(self, records, source, *, deleted=(), cursor=None, change_seq=None, change_token=None, backfill_done=None, source_stats=None):
         """Messages and ingestion checkpoint commit together; replay is idempotent."""
@@ -230,11 +290,13 @@ class Store:
                 DO UPDATE SET data=excluded.data,updated_at=now()''', (name,Jsonb(data)))
 
     def pending(self, limit=16):
+        freshness = self.telegram_consent_freshness()
         with self.connection() as db:
             return db.execute('''SELECT e.hash,e.text,e.attempts,e.ctid::text AS ctid FROM embeddings e
                 WHERE embedding IS NULL AND retry_at<=now()
                 AND EXISTS(SELECT 1 FROM message_chunks c JOIN messages m ON m.id=c.message_pk WHERE c.hash=e.hash
-                    AND (m.source!='whatsapp' OR m.chat_id NOT LIKE '%%@g.us' OR EXISTS(SELECT 1 FROM group_monitoring_consent gc WHERE gc.chat_jid=m.chat_id)))
+                    AND (m.source!='whatsapp' OR m.chat_id NOT LIKE '%%@g.us' OR EXISTS(SELECT 1 FROM group_monitoring_consent gc WHERE gc.chat_jid=m.chat_id))
+                    AND (m.source!='telegram' OR m.chat_id NOT LIKE '-%%' OR (EXISTS(SELECT 1 FROM telegram_monitoring_allowed tc WHERE tc.chat_id=m.chat_id) AND ''' + freshness + ''')))
                 ORDER BY priority DESC,retry_at,created_at LIMIT %s''', (min(limit,1024),)).fetchall()
 
     def switch_model(self, label, identity):
@@ -286,10 +348,18 @@ class Store:
             db.execute('''UPDATE embeddings SET attempts=attempts+1,last_error=%s,
                 retry_at=now()+(%s * interval '1 second') WHERE hash=ANY(%s)''', (reason[:160],delay,list(hashes)))
 
+    @staticmethod
+    def telegram_consent_freshness():
+        # Successful source synchronization grants a 60-second lease. A failed
+        # worker cannot leave group approval valid indefinitely.
+        cutoff = time.time() - 60
+        return f"EXISTS(SELECT 1 FROM memory_meta WHERE key='telegram_consent_refreshed_at' AND CAST(value AS double precision)>{cutoff})"
+
     def filters(self, source=None, chat=None, after=None, before=None, sender=None, alias='m'):
         if source is not None and source not in SOURCES:
             raise ValueError('source must be whatsapp or telegram')
         clauses = [f"({alias}.source!='whatsapp' OR {alias}.chat_id NOT LIKE '%%@g.us' OR EXISTS(SELECT 1 FROM group_monitoring_consent gc WHERE gc.chat_jid={alias}.chat_id))"]
+        clauses.append(f"({alias}.source!='telegram' OR {alias}.chat_id NOT LIKE '-%%' OR (EXISTS(SELECT 1 FROM telegram_monitoring_allowed tc WHERE tc.chat_id={alias}.chat_id) AND {self.telegram_consent_freshness()}))")
         values = []
         for key, value, op in [('source',source,'='),('chat_id',chat,'='),('timestamp',after,'>='),('timestamp',before,'<='),('sender',sender,'=')]:
             if value is not None:
@@ -386,6 +456,10 @@ class Store:
         lag = max(0, source_latest - int(latest)) if latest and source_latest else None
         return dict(lag_s=lag, pending_embeddings=bounded if bounded <= 5000 else max(estimate, bounded),
                     ingested_last_hour=hour, last_indexed_at=int(latest) if latest else None)
+
+    def worker_status(self):
+        with self.connection('3s') as db:
+            return db.execute("SELECT * FROM worker_state WHERE name NOT IN ('status','status_error') ORDER BY name").fetchall()
 
     def status_error(self):
         with self.connection('3s') as db:

@@ -16,6 +16,7 @@ from store import Store
 
 ROOT=Path.home()/'.local/share/messaging-memory'
 STOP=threading.Event()
+CONSENT_LOCK=threading.Lock()
 
 
 def ingest_step(store, source):
@@ -47,7 +48,9 @@ def batch_limits(model):
     return (rows if isinstance(rows, int) else 16), (size if isinstance(size, int) else 1600)
 
 
-def embedding_step(store, model):
+def embedding_step(store, model, sources=None):
+    if sources is not None:
+        refresh_consent(store, sources, cleanup=False)
     max_rows,max_bytes=batch_limits(model)
     rows=bounded_batch(store.pending(max_rows), max_bytes, max_rows)
     if not rows:
@@ -131,11 +134,26 @@ def refresh_source_stats(store,source,refresh):
         pass
 
 
+def refresh_consent(store, sources, *, cleanup=False):
+    """Publish current policy even when interactive work postpones ingestion."""
+    with CONSENT_LOCK:
+        for source in sources:
+            if source.kind == 'whatsapp':
+                store.sync_group_consent(source.allowed_groups(), cleanup=cleanup)
+            else:
+                store.sync_telegram_consent(source.allowed_groups(), source.telegram_channels(), cleanup=cleanup)
+
+
 def ingestion_loop(store, sources):
     refresh,installed={},set()
     while not STOP.is_set():
+        try:
+            refresh_consent(store, sources, cleanup=False)
+        except Exception:
+            STOP.wait(5)
+            continue
         if queries_waiting(ROOT):
-            STOP.wait(.2)
+            STOP.wait(1)
             continue
         worked=False
         for source in sources:
@@ -145,8 +163,7 @@ def ingestion_loop(store, sources):
                 if source.kind not in installed:
                     source.install_capture()
                     installed.add(source.kind)
-                if source.kind == 'whatsapp':
-                    store.sync_group_consent(source.allowed_groups())
+                refresh_consent(store, [source], cleanup=True)
                 plan=recovery_plan(store.state(source.kind),source)
                 if plan['reset_required']:
                     store.reset_source(source.kind,plan['source_identity'])
@@ -214,9 +231,11 @@ def run(root=None, config_path=None, source_paths=None):
         raise ValueError('Use history.py worker with configured source paths')
     sources=[Source(kind,Path(path)) for kind,path in source_paths.items()]
     for source in sources:
+        source.install_capture()
         if source.kind == 'whatsapp':
-            source.install_capture()
             store.sync_group_consent(source.allowed_groups())
+        else:
+            store.sync_telegram_consent(source.allowed_groups(), source.telegram_channels())
     for sig in (signal.SIGTERM,signal.SIGINT):
         signal.signal(sig,lambda *_:STOP.set())
     thread=threading.Thread(target=ingestion_loop,args=(store,sources),daemon=True)
@@ -224,10 +243,11 @@ def run(root=None, config_path=None, source_paths=None):
     threading.Thread(target=status_loop,args=(store,STOP),daemon=True).start()
     while not STOP.is_set():
         try:
+            refresh_consent(store, sources, cleanup=False)
             if model.interactive_recent():
                 STOP.wait(2)
                 continue
-            worked=embedding_step(store,model)
+            worked=embedding_step(store,model,sources=sources)
             STOP.wait(pace_seconds(worked))
         except Exception as error:
             print(json.dumps(dict(component='worker',error=type(error).__name__)),flush=True)

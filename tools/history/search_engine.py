@@ -53,6 +53,11 @@ def execute(store,model,body,filters):
     if hint:
         candidates=data.resolve(filters['source'],hint,explicit=bool(filters.get('chat')))
         if len(candidates)!=1:
+            try:
+                candidates = data.authorized(candidates, source=filters['source'], chats=True)
+            except Exception as error:
+                candidates = []
+                base.update(degraded=True,authorization_error=type(error).__name__)
             base.update(status='needs_disambiguation' if candidates else 'chat_not_found',chat_candidates=candidates)
             timings['total']=round((time.monotonic()-started)*1000,1)
             return base
@@ -123,6 +128,17 @@ def execute(store,model,body,filters):
     try:covered=data.coverage(combined)
     except Exception as error:
         covered={};base.update(degraded=True,coverage_unavailable=True,coverage_error=type(error).__name__)
+    try:
+        combined = data.authorized(combined)
+    except Exception as error:
+        combined = []
+        base.update(degraded=True,authorization_error=type(error).__name__)
+    allowed_ids = {row['id'] for row in combined}
+    ranked = [row for row in ranked if row['id'] in allowed_ids]
+    for row in ranked:
+        if 'context' in row:
+            row['context'] = [item for item in row['context'] if item['id'] in allowed_ids]
+    combined = ranked + [item for row in ranked for item in row.get('context', [])]
     for row in combined:
         if 'chat_id' in row:row['embedding_ready']=None if base.get('coverage_unavailable') else bool(covered.get(row['id'],False))
     base.update(bound_evidence(combined))

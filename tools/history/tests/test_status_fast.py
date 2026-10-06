@@ -173,3 +173,38 @@ class PacingTests(unittest.TestCase):
             p.write_text('some avg10=73.54 avg60=79.97 avg300=79.01 total=1\nfull avg10=60.00 avg60=1 avg300=1 total=1\n')
             self.assertEqual(worker.io_pressure_some(p), 73.54)
             self.assertEqual(worker.io_pressure_some(Path(d) / 'missing'), 0.)
+
+class ConsentSchedulingTests(unittest.TestCase):
+    def source(self, kind):
+        from unittest.mock import Mock
+        source = Mock(kind=kind)
+        source.allowed_groups.return_value = ['approved']
+        source.telegram_channels.return_value = ['channel']
+        return source
+
+    def test_interactive_queue_cannot_postpone_policy(self):
+        from unittest.mock import Mock, patch
+        store = Mock()
+        sources = [self.source('whatsapp'), self.source('telegram')]
+        stop = Mock()
+        stop.is_set.side_effect = [False, True]
+        with patch.object(worker, 'STOP', stop), patch.object(worker, 'queries_waiting', return_value=True), patch.object(worker, 'ingest_step') as ingest:
+            worker.ingestion_loop(store, sources)
+        store.sync_group_consent.assert_called_once_with(['approved'], cleanup=False)
+        store.sync_telegram_consent.assert_called_once_with(['approved'], ['channel'], cleanup=False)
+        ingest.assert_not_called()
+
+    def test_embedding_checks_policy_before_pending_and_fails_closed(self):
+        from unittest.mock import Mock
+        order = []
+        store, model = Mock(), Mock()
+        source = self.source('telegram')
+        store.sync_telegram_consent.side_effect = lambda *a, **kw: order.append('policy')
+        store.pending.side_effect = lambda *a: order.append('pending') or []
+        self.assertFalse(worker.embedding_step(store, model, sources=[source]))
+        self.assertEqual(order, ['policy', 'pending'])
+        store.sync_telegram_consent.side_effect = RuntimeError('policy unavailable')
+        store.pending.reset_mock()
+        with self.assertRaises(RuntimeError): worker.embedding_step(store, model, sources=[source])
+        store.pending.assert_not_called()
+        model.embed.assert_not_called()

@@ -20,7 +20,7 @@ class SearchData:
         key=(self.store.schema,source)
         with DIRECTORY_LOCK:
             hit=DIRECTORIES.get(key)
-            if source != 'whatsapp' and hit and time.monotonic()-hit[0]<120:return hit[1]
+            # Every directory includes a consent-controlled source; read current policy.
         where,values=self.store.filters(source=source)
         with self.connection(8) as db:
             rows=db.execute('SELECT DISTINCT ON(chat_id) chat_id,chat_name FROM messages m WHERE '+where+' ORDER BY chat_id DESC,timestamp DESC LIMIT 10000',values).fetchall()
@@ -86,6 +86,22 @@ class SearchData:
                     ' AND (m.timestamp,m.id) '+op+' (%s,%s) ORDER BY m.timestamp '+order+',m.id '+order+' LIMIT %s',
                     values+[row['timestamp'],row['id'],limit//2]).fetchall())
             return sorted(rows,key=lambda r:(r['timestamp'],r['id']))
+
+    def authorized(self, rows, *, source=None, chats=False):
+        """Recheck retained evidence against one current policy snapshot before returning it."""
+        if not rows:
+            return []
+        where, values = self.store.filters(source=source)
+        column = 'chat_id' if chats else 'id'
+        identities = list({r[column] for r in rows})
+        with self.connection(4) as db:
+            current = db.execute('SELECT DISTINCT m.id,m.source,m.chat_id FROM messages m WHERE ' + where +
+                                 f' AND m.{column}=ANY(%s)', values + [identities]).fetchall()
+        if chats:
+            allowed = {r['chat_id'] for r in current}
+            return [r for r in rows if r['chat_id'] in allowed]
+        allowed = {(r['id'], r['source'], r['chat_id']) for r in current}
+        return [r for r in rows if (r['id'], r['source'], r['chat_id']) in allowed]
 
     def coverage(self,rows):
         ids=list({r['id'] for r in rows if 'chat_id' in r})

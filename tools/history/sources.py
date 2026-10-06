@@ -119,6 +119,37 @@ class Source:
                         INSERT INTO memory_changes(chat_id,message_id,op)
                         SELECT chat_jid,id,'upsert' FROM messages WHERE chat_jid={prefix}.chat_jid;
                         END""")
+            if self.kind == 'telegram':
+                c.execute("""CREATE TABLE IF NOT EXISTS group_monitoring_consent(
+                    chat_id INTEGER PRIMARY KEY,allowed INTEGER NOT NULL DEFAULT 0,
+                    evidence TEXT NOT NULL,updated_at TEXT NOT NULL)""")
+                typed = 'type' in {r['name'] for r in c.execute('PRAGMA table_info(chats)')}
+                channel = " OR EXISTS(SELECT 1 FROM chats WHERE id=new.chat_id AND type='channel')" if typed else ''
+                for table in ('messages', 'transcripts'):
+                    if not self._has(c, table):
+                        continue
+                    for event in ('INSERT', 'UPDATE'):
+                        c.execute(f"""CREATE TRIGGER IF NOT EXISTS memory_telegram_guard_{table}_{event.lower()}
+                            BEFORE {event} ON {table} WHEN NOT (new.chat_id>0{channel}
+                            OR EXISTS(SELECT 1 FROM group_monitoring_consent g WHERE g.chat_id=new.chat_id AND g.allowed=1))
+                            BEGIN SELECT RAISE(IGNORE); END""")
+                for event,prefix in [('INSERT','new'),('UPDATE','new'),('DELETE','old')]:
+                    c.execute(f"""CREATE TRIGGER IF NOT EXISTS memory_telegram_consent_{event.lower()}
+                        AFTER {event} ON group_monitoring_consent BEGIN
+                        INSERT INTO memory_changes(chat_id,message_id,op)
+                        SELECT CAST(chat_id AS TEXT),CAST(id AS TEXT),'upsert' FROM messages WHERE chat_id={prefix}.chat_id;
+                        END""")
+                if typed:
+                    for event in ('INSERT','UPDATE','DELETE'):
+                        prefix = 'old' if event == 'DELETE' else 'new'
+                        c.execute(f'DROP TRIGGER IF EXISTS memory_telegram_chat_{event.lower()}')
+                        condition = ' WHEN old.type IS NOT new.type OR old.id IS NOT new.id' if event == 'UPDATE' else ''
+                        affected = 'chat_id IN (old.id,new.id)' if event == 'UPDATE' else f'chat_id={prefix}.id'
+                        c.execute(f"""CREATE TRIGGER memory_telegram_chat_{event.lower()}
+                            AFTER {event} ON chats{condition} BEGIN
+                            INSERT INTO memory_changes(chat_id,message_id,op)
+                            SELECT CAST(chat_id AS TEXT),CAST(id AS TEXT),'upsert' FROM messages WHERE {affected};
+                            END""")
             watched = [chat, 'id', f['body'], f['date'], f['sender'], 'media_type']
             if self.kind == 'whatsapp' and 'file_sha256' in columns:
                 watched += ['file_sha256']
@@ -205,31 +236,42 @@ class Source:
                     text=text, media_type=row['media_type'] or '')
 
     def _consent_filter(self, c):
-        if self.kind != 'whatsapp':
-            return ''
+        if self.kind == 'telegram':
+            typed = 'type' in {r['name'] for r in c.execute('PRAGMA table_info(chats)')}
+            channel = " OR c.type='channel'" if typed else ''
+            consent = " OR EXISTS(SELECT 1 FROM group_monitoring_consent g WHERE g.chat_id=m.chat_id AND g.allowed=1)" if self._has(c, 'group_monitoring_consent') else ''
+            return f" AND (m.chat_id>0{channel}{consent})"
+
         if not self._has(c, 'group_monitoring_consent'):
             return " AND m.chat_jid NOT LIKE '%@g.us'"
         return " AND (m.chat_jid NOT LIKE '%@g.us' OR EXISTS(SELECT 1 FROM group_monitoring_consent g WHERE g.chat_jid=m.chat_jid AND g.allowed=1))"
 
     def allowed_groups(self):
-        if self.kind != 'whatsapp':
-            return []
         with self._db() as c:
             if not self._has(c, 'group_monitoring_consent'):
                 return []
-            return [r[0] for r in c.execute('SELECT chat_jid FROM group_monitoring_consent WHERE allowed=1 ORDER BY chat_jid')]
+            column = 'chat_jid' if self.kind == 'whatsapp' else 'chat_id'
+            return [str(r[0]) for r in c.execute(f'SELECT {column} FROM group_monitoring_consent WHERE allowed=1 ORDER BY {column}')]
+
+    def telegram_channels(self):
+        if self.kind != 'telegram':
+            return []
+        with self._db() as c:
+            if 'type' not in {r['name'] for r in c.execute('PRAGMA table_info(chats)')}:
+                return []
+            return [str(r[0]) for r in c.execute("SELECT id FROM chats WHERE type='channel' ORDER BY id")]
 
     def backfill_page(self, after_rowid: int, limit: int):
         """Page cached rows, including empty text, excluding Telegram tombstones."""
         with self._db() as c:
-            alive = ' AND COALESCE(m.deleted,0)=0' if self.kind == 'telegram' else self._consent_filter(c)
+            alive = self._consent_filter(c) + (' AND COALESCE(m.deleted,0)=0' if self.kind == 'telegram' else '')
             rows = c.execute(self._select(c) + f' WHERE m.rowid>?{alive} ORDER BY m.rowid LIMIT ?',
                              (int(after_rowid), _limit(limit))).fetchall()
             return [self._normalize(row) for row in rows]
 
     def get(self, chat_id, message_id):
         with self._db() as c:
-            alive = ' AND COALESCE(m.deleted,0)=0' if self.kind == 'telegram' else self._consent_filter(c)
+            alive = self._consent_filter(c) + (' AND COALESCE(m.deleted,0)=0' if self.kind == 'telegram' else '')
             row = c.execute(self._select(c) + f" WHERE m.{self.fields['chat']}=? AND m.id=?{alive}",
                             (str(chat_id), str(message_id))).fetchone()
             return self._normalize(row) if row else None

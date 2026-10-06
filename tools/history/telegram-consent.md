@@ -1,0 +1,13 @@
+# Telegram history consent
+
+The source adapter reads explicit approval from SQLite `group_monitoring_consent(chat_id INTEGER PRIMARY KEY, allowed INTEGER NOT NULL DEFAULT 0, evidence TEXT NOT NULL, updated_at TEXT NOT NULL)`. Positive peer IDs remain readable; known `chats.type='channel'` broadcasts remain readable. Negative peers without either channel classification or explicit approval are denied, including unknown peers and groups.
+
+`Source.allowed_groups()` returns explicitly approved Telegram IDs as strings. `Source.telegram_channels()` returns known channel IDs separately. The worker calls `Store.sync_telegram_consent(allowed_groups, channels)` at startup and before each ingestion cycle. This publishes the union into PostgreSQL `telegram_monitoring_allowed(chat_id text PRIMARY KEY)` before cleanup starts. Existing reader roles need SELECT on this table; the standard installer grants SELECT on all tables and configures default privileges.
+
+Search, context, directory, coverage, analytics, and pending embedding selection exclude negative Telegram peers absent the PostgreSQL table. Directories read current policy without reusing cached entries. Capture triggers enqueue historical message identities when consent or chat classification changes; grants therefore reimport retained original rows without resetting source checkpoints. Source guards suppress new denied message and transcript writes. They do not delete original rows.
+
+Cleanup only removes derived PostgreSQL messages, their cascading chunks, and unreferenced embeddings. It scans at most 200 message IDs and 500 embedding hashes per cycle, with committed cursors in independent `telegram_*` memory metadata keys. Cleanup interruption does not undo the committed visibility policy or reset WhatsApp cleanup state.
+
+All regression fixtures use synthetic messages. Run the opt-in isolated Docker suite from the package root with `HISTORY_DOCKER_TEST=1 PYTHONPATH=tools/history python -m unittest discover -s tools/history/tests`.
+
+Successful Telegram policy refresh grants negative-peer visibility for 60 seconds, renewed on every successful synchronization. If source or worker refresh fails, negative groups and channels become unavailable when the lease expires; positive direct messages remain available. Policy synchronization runs before interactive work can postpone ingestion and immediately before pending embedding selection, without cleanup on these fast paths. Final search serialization rechecks retained anchors, context, and disambiguation candidates against current PostgreSQL permissions; a failed authorization query returns no evidence. Chat metadata updates only requeue history when the peer ID or type changes.

@@ -175,6 +175,12 @@ class IntegrationTests(unittest.TestCase):
                 with sqlite3.connect(source) as db:
                     db.execute("UPDATE group_monitoring_consent SET allowed=0 WHERE chat_jid='123@g.us'")
                 wait_until(lambda: not request('/search',dict(source='whatsapp',query='violet',mode='keyword'))['results'])
+                # Visibility commits before bounded physical cleanup. Let that
+                # independent worker phase finish before stopping the worker.
+                def revoked_derived_removed():
+                    with psycopg.connect(credentials['reader_dsn']) as db:
+                        return db.execute("SELECT count(*) FROM messages WHERE chat_id='123@g.us'").fetchone()[0] == 0
+                wait_until(revoked_derived_removed)
                 self.assertTrue((data / 'embedding-usage.json').is_file())
                 for process in processes:
                     process.terminate()

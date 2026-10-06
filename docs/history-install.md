@@ -166,3 +166,5 @@ HISTORY_DOCKER_TEST=1 PYTHONPATH=/opt/whatsapp-mcp/tools/history \
 ```
 
 The Docker image digest above is the tested package fixture. If that digest is unavailable for your architecture, use a compatible PostgreSQL 16/pgvector image in your deployment and verify pgvector's version; the checked-in integration fixture deliberately remains pinned.
+
+Telegram groups and supergroups require explicit per-group monitoring approval. The index preserves private chats and known broadcast channels, and denies unknown negative peers. See [Telegram consent](../tools/history/telegram-consent.md) for the source schema, policy refresh and derived-data cleanup. Existing installations must grant the read-only database role SELECT on `telegram_monitoring_allowed` when upgrading.
