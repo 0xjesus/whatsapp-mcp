@@ -2,6 +2,8 @@ package client
 
 import (
 	"context"
+	"fmt"
+	"github.com/sealjay/mcp-whatsapp/internal/store"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -77,5 +79,34 @@ func TestMonitoringWorkerSkipsDisconnected(t *testing.T) {
 	<-done
 	if calls.Load() != 0 {
 		t.Fatal("disconnected metadata call")
+	}
+}
+
+func TestMonitoringInvalidationTargetsChangedGroup(t *testing.T) {
+	c, s := scheduledTestClient(t)
+	groups := make([]store.MonitoringGroup, 105)
+	for i := range groups {
+		groups[i] = store.MonitoringGroup{JID: fmt.Sprintf("%d@g.us", 1000+i), Members: 10}
+	}
+	if err := s.ReconcileMonitoring(groups); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().Exec(`UPDATE group_monitoring_policy SET enabled=1`); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.publishMonitoringPolicy(0, groups); err != nil {
+		t.Fatal(err)
+	}
+	c.invalidateMonitoringPolicy(groups[0].JID)
+	for _, group := range groups[1:] {
+		if !s.MonitoringAllowed(group.JID) {
+			t.Fatal("unrelated permit invalidated", group.JID)
+		}
+	}
+	if err := c.publishMonitoringPolicy(0, groups); err != nil {
+		t.Fatal(err)
+	}
+	if s.MonitoringAllowed(groups[0].JID) {
+		t.Fatal("stale snapshot regranted changedgroup")
 	}
 }

@@ -74,3 +74,9 @@ func (s *Store) InvalidateAutomaticMonitoring() error {
 	_, err := s.db.Exec(`UPDATE group_monitoring_consent SET allowed=0 WHERE evidence LIKE 'auto:max-members:%'`)
 	return err
 }
+
+// InvalidateAutomaticMonitoringGroup affects only the peer whose membership changed.
+func (s *Store) InvalidateAutomaticMonitoringGroup(chatJID string) error {
+	_, err := s.db.Exec(`UPDATE group_monitoring_consent SET allowed=0 WHERE chat_jid=? AND evidence LIKE 'auto:max-members:%'`, chatJID)
+	return err
+}

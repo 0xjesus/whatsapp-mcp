@@ -34,8 +34,11 @@ func (c *Client) StartEventHandler() {
 			c.log.Infof("Connected to WhatsApp")
 			c.clearHealth("connected")
 			c.requestMonitoringRefresh()
-		case *events.GroupInfo, *events.JoinedGroup:
-			c.invalidateMonitoringPolicy()
+		case *events.GroupInfo:
+			c.invalidateMonitoringPolicy(v.JID.String())
+			c.requestMonitoringRefresh()
+		case *events.JoinedGroup:
+			c.invalidateMonitoringPolicy(v.JID.String())
 			c.requestMonitoringRefresh()
 		case *events.LoggedOut:
 			c.log.Warnf("Device logged out (reason %d, onConnect=%v), please scan QR code to log in again", v.Reason, v.OnConnect)

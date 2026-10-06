@@ -112,7 +112,7 @@ func TestMonitoringGenerationRejectsStaleSnapshot(t *testing.T) {
 	if !s.MonitoringAllowed("123@g.us") {
 		t.Fatal("initial grant")
 	}
-	c.invalidateMonitoringPolicy()
+	c.invalidateMonitoringPolicy("123@g.us")
 	if err := c.publishMonitoringPolicy(0, groups); err != nil {
 		t.Fatal(err)
 	}

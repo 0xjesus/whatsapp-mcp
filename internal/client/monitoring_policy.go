@@ -31,11 +31,11 @@ func (c *Client) refreshMonitoringPolicy(parent context.Context) {
 	}
 }
 
-func (c *Client) invalidateMonitoringPolicy() {
+func (c *Client) invalidateMonitoringPolicy(chatJID string) {
 	c.monitoringStateMu.Lock()
 	defer c.monitoringStateMu.Unlock()
 	c.monitoringGeneration++
-	c.store.InvalidateAutomaticMonitoring()
+	c.store.InvalidateAutomaticMonitoringGroup(chatJID)
 }
 func (c *Client) publishMonitoringPolicy(generation uint64, inventory []store.MonitoringGroup) error {
 	c.monitoringStateMu.Lock()
