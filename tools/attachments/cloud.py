@@ -73,7 +73,7 @@ def next_month():
 
 
 def enrich(path, filename, media_type, local, client, previous=None, max_units=8):
-    from tools.attachments.cloud_client import BudgetExceeded, CloudError, RequestDeferred, AuthorizationDenied
+    from tools.attachments.cloud_client import BudgetExceeded, CloudError, RequestDeferred, AuthorizationDenied, RetryExhausted
     if local['status'] not in ('done','partial'):
         return local
     previous = previous or {}
@@ -109,6 +109,9 @@ def enrich(path, filename, media_type, local, client, previous=None, max_units=8
     except RequestDeferred:
         reason = 'cloud_deferred'
         retry_at = time.time()+300
+    except RetryExhausted:
+        outcome['cloud_pending'] = False
+        reason = 'cloud_retry_exhausted'
     except CloudError:
         reason = 'cloud_error'
         retry_at = time.time()+3600

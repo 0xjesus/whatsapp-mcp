@@ -51,3 +51,20 @@ class EnrichmentTests(unittest.TestCase):
         self.assertEqual(got['text'],'preserved original')
         self.assertEqual(got['reason'],'cloud_preparation_error')
         self.assertEqual(got['status'],'partial')
+
+    def test_retry_exhaustion_is_terminal_partial_and_preserves_evidence(self):
+        from tools.attachments.cloud import enrich, VERSION
+        from tools.attachments.cloud_client import RetryExhausted
+        class Client:
+            def analyze(self,content):raise RetryExhausted('attempts exhausted')
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'synthetic.txt';path.write_text('local evidence '*1000)
+            local={'text':path.read_text(),'status':'done'}
+            prior={'cloud_version':VERSION,'cloud_next':1,'cloud_text':'previous cloud evidence'}
+            got=enrich(path,'synthetic.txt','document',local,Client(),previous=prior)
+            self.assertEqual(got['status'],'partial')
+            self.assertFalse(got['cloud_pending'])
+            self.assertEqual(got['reason'],'cloud_retry_exhausted')
+            self.assertTrue(got['text'].startswith(local['text']))
+            self.assertIn('previous cloud evidence',got['text'])
+            self.assertEqual(got['cloud_next'],1)
