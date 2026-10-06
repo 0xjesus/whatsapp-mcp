@@ -53,10 +53,11 @@ type Client struct {
 	limiter              *ratelimit.Limiter
 	health               health
 	recoveryMu           sync.Mutex
-	monitoringMu         sync.Mutex
 	monitoringStateMu    sync.Mutex
 	monitoringGeneration uint64
 	monitoringOnce       sync.Once
+	monitoringWake       chan struct{}
+	monitoringContext    context.Context
 	schedulerOnce        sync.Once
 	schedulerCancel      context.CancelFunc
 	schedulerDone        chan struct{}
@@ -164,12 +165,13 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	}
 	limiter.RestoreSends(all, unknown)
 	c := &Client{
-		wa:               wa,
-		store:            cfg.Store,
-		log:              logger,
-		allowedMediaRoot: cfg.AllowedMediaRoot,
-		redactor:         redactor,
-		limiter:          limiter,
+		wa:                wa,
+		store:             cfg.Store,
+		monitoringContext: ctx,
+		log:               logger,
+		allowedMediaRoot:  cfg.AllowedMediaRoot,
+		redactor:          redactor,
+		limiter:           limiter,
 	}
 	return c, nil
 }

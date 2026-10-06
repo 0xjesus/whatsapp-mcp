@@ -33,21 +33,10 @@ func (c *Client) StartEventHandler() {
 		case *events.Connected:
 			c.log.Infof("Connected to WhatsApp")
 			c.clearHealth("connected")
-			go c.refreshMonitoringPolicy()
-			c.monitoringOnce.Do(func() {
-				go func() {
-					ticker := time.NewTicker(5 * time.Minute)
-					defer ticker.Stop()
-					for range ticker.C {
-						if c.wa.IsConnected() {
-							c.refreshMonitoringPolicy()
-						}
-					}
-				}()
-			})
+			c.requestMonitoringRefresh()
 		case *events.GroupInfo, *events.JoinedGroup:
 			c.invalidateMonitoringPolicy()
-			go c.refreshMonitoringPolicy()
+			c.requestMonitoringRefresh()
 		case *events.LoggedOut:
 			c.log.Warnf("Device logged out (reason %d, onConnect=%v), please scan QR code to log in again", v.Reason, v.OnConnect)
 			c.setHealth(HealthLoggedOut, time.Time{}, fmt.Sprintf("logged out by WhatsApp (reason %d)", v.Reason), true)
