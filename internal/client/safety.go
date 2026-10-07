@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -57,6 +58,18 @@ func (c *Client) setHealth(state HealthState, until time.Time, reason string, al
 	h := &c.health
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.state != "" && h.state != HealthOK && (h.until.IsZero() || c.currentTime().Before(h.until)) {
+		if healthPriority(h.state) > healthPriority(state) {
+			return
+		}
+		if healthPriority(h.state) == healthPriority(state) {
+			until = longerRestriction(h.until, until)
+			allSends = allSends || h.allSends
+			if strings.HasPrefix(h.reason, "circuit breaker:") {
+				reason = h.reason
+			}
+		}
+	}
 	h.state, h.until, h.reason, h.allSends, h.setAt = state, until, reason, allSends, c.currentTime()
 	c.persistHealthLocked()
 	c.log.Errorf("ACCOUNT HEALTH → %s (%s) until=%s allSends=%v", state, reason, fmtUntil(until), allSends)
@@ -88,31 +101,8 @@ func fmtUntil(t time.Time) string {
 // sendGate reports whether a send may proceed given the current health.
 // Expired restrictions clear themselves here.
 func (c *Client) sendGate(isContact bool) error {
-	h := &c.health
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if c.healthPersistErr != nil {
-		return fmt.Errorf("SEND BLOCKED: health persistence failed: %w", c.healthPersistErr)
-	}
-	if h.state == "" || h.state == HealthOK {
-		return nil
-	}
-	if !h.until.IsZero() && !c.currentTime().Before(h.until) {
-		c.log.Infof("ACCOUNT HEALTH → ok (restriction %q expired)", h.reason)
-		h.state, h.until, h.reason, h.allSends = HealthOK, time.Time{}, "", false
-		c.persistHealthLocked()
-		return nil
-	}
-	switch h.state {
-	case HealthRestricted:
-		if h.allSends || !isContact {
-			return fmt.Errorf("SEND BLOCKED: WhatsApp restricted this account (%s). Sends%s resume after %s. Do not retry, restart or re-pair the daemon: that worsens the restriction. Tell the user and wait.",
-				h.reason, map[bool]string{true: "", false: " to new contacts"}[h.allSends], fmtUntil(h.until))
-		}
-		return nil
-	default:
-		return fmt.Errorf("SEND BLOCKED: account state is %s (%s), until %s. Tell the user; do not retry automatically.", h.state, h.reason, fmtUntil(h.until))
-	}
+	err, _, _ := c.sendSafety(isContact)
+	return err
 }
 
 // noteSendError classifies a failed send. Server-side abuse signals put the
@@ -184,11 +174,28 @@ func (c *Client) HealthSnapshot() map[string]any {
 	if state != HealthOK && !h.until.IsZero() && !c.currentTime().Before(h.until) {
 		state = HealthOK
 	}
+	reason, until, allSends := h.reason, h.until, h.allSends
+	nativeActive := c.nativeRestriction.active(c.currentTime())
+	if nativeActive {
+		if state == HealthOK {
+			state, reason, until = HealthRestricted, "native account restriction: "+c.nativeRestriction.EnforcementType, c.nativeRestriction.Until
+		} else if state == HealthRestricted {
+			until = longerRestriction(until, c.nativeRestriction.Until)
+		}
+		allSends = true
+	}
 	out := map[string]any{"state": state, "humanize": os.Getenv("WHATSAPP_MCP_HUMANIZE") != "0"}
+	if !c.nativeRestriction.EventAt.IsZero() {
+		out["native_restriction"] = c.nativeRestriction
+		out["native_restriction_active"] = nativeActive
+	}
+	if c.nativePersistErr != nil || c.healthPersistErr != nil {
+		out["send_protection_error"] = "persistence failed; sends blocked"
+	}
 	if state != HealthOK {
-		out["reason"] = h.reason
-		out["until"] = fmtUntil(h.until)
-		out["blocks_all_sends"] = h.allSends
+		out["reason"] = reason
+		out["until"] = fmtUntil(until)
+		out["blocks_all_sends"] = allSends
 		out["advice"] = "Do not retry, restart or re-pair. Wait for `until`, and tell the user."
 	}
 	if h.lastErr != "" {
@@ -261,14 +268,19 @@ func (c *Client) sendFeatureMessage(ctx context.Context, recipient types.JID, ms
 		return whatsmeow.SendResponse{}, err
 	}
 	known := recipient.Server == types.GroupServer || (c.store != nil && c.IsKnownContact(recipient))
-	d, err := c.reserveSend(ctx, known)
+	d, err := c.reserveRecipientSend(ctx, c.recipientBudgetKey(recipient), known)
 	if err != nil {
 		return whatsmeow.SendResponse{}, err
 	}
 	if !d.Allowed {
 		return whatsmeow.SendResponse{}, fmt.Errorf("rate limited: %s — retry in %s", d.Reason, d.RetryAfter.Round(time.Second))
 	}
-	resp, err := c.wa.SendMessage(ctx, recipient, msg)
+	var resp whatsmeow.SendResponse
+	if c.networkSend != nil {
+		resp, err = c.networkSend(ctx, recipient, msg, whatsmeow.GenerateMessageID())
+	} else {
+		resp, err = c.wa.SendMessage(ctx, recipient, msg)
+	}
 	c.noteMutationResult(err)
 	if err == nil {
 		c.noteSendOK()

@@ -53,6 +53,8 @@ type Client struct {
 	redactor             *security.Redactor
 	limiter              *ratelimit.Limiter
 	health               health
+	nativeRestriction    nativeRestriction // guarded by health.mu
+	nativePersistErr     error             // independent of legacy health persistence
 	recoveryMu           sync.Mutex
 	monitoringStateMu    sync.Mutex
 	monitoringGeneration uint64

@@ -306,7 +306,7 @@ CREATE TABLE IF NOT EXISTS outbound_jobs (
  sent_id TEXT NOT NULL DEFAULT '', sender TEXT NOT NULL DEFAULT '', idempotency_key TEXT NOT NULL DEFAULT '', request_hash TEXT NOT NULL DEFAULT '', payload TEXT NOT NULL, media BLOB
 );
 CREATE TABLE IF NOT EXISTS outbound_protection (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS outbound_attempts (at_ns INTEGER NOT NULL, known INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS outbound_attempts (at_ns INTEGER NOT NULL, known INTEGER NOT NULL, recipient TEXT NOT NULL DEFAULT '');
 CREATE INDEX IF NOT EXISTS outbound_attempts_by_time ON outbound_attempts(at_ns);
 
 CREATE TABLE IF NOT EXISTS view_once_media (
@@ -376,6 +376,24 @@ CREATE TABLE IF NOT EXISTS message_mutations (
 // any ALTER. Every step is idempotent — running migrateSchema twice is a
 // no-op on an up-to-date DB.
 func migrateSchema(db *sql.DB) error {
+	var attemptsExist int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='outbound_attempts'`).Scan(&attemptsExist); err != nil {
+		return err
+	}
+	if attemptsExist > 0 {
+		var recipientColumn int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('outbound_attempts') WHERE name='recipient'`).Scan(&recipientColumn); err != nil {
+			return err
+		}
+		if recipientColumn == 0 {
+			if _, err := db.Exec(`ALTER TABLE outbound_attempts ADD COLUMN recipient TEXT NOT NULL DEFAULT ''`); err != nil {
+				return err
+			}
+		}
+		if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS outbound_attempts_by_recipient ON outbound_attempts(recipient, at_ns)`); err != nil {
+			return err
+		}
+	}
 	var schedulerExists int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='scheduled_messages'`).Scan(&schedulerExists); err != nil {
 		return err

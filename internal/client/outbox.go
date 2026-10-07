@@ -10,13 +10,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/sealjay/mcp-whatsapp/internal/ratelimit"
 	"github.com/sealjay/mcp-whatsapp/internal/store"
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -226,8 +226,21 @@ func outboxResult(j store.OutboxJob) SendResult {
 }
 
 func (c *Client) reserveSend(ctx context.Context, known bool) (ratelimit.Decision, error) {
+	return c.reserveRecipientSend(ctx, "", known)
+}
+
+// Device aliases and known LIDs share the same local recipient quota.
+func (c *Client) recipientBudgetKey(jid types.JID) string {
+	key := jid.ToNonAD().String()
 	if c.store != nil {
-		d, e := c.store.PersistentSendBudget(ctx, c.currentTime(), known, false)
+		key = c.store.ResolveLIDToJID(key)
+	}
+	return key
+}
+
+func (c *Client) reserveRecipientSend(ctx context.Context, recipient string, known bool) (ratelimit.Decision, error) {
+	if c.store != nil {
+		d, e := c.store.PersistentRecipientSendBudget(ctx, c.currentTime(), recipient, known, false)
 		if e != nil || !d.Allowed {
 			return d, e
 		}
@@ -241,7 +254,7 @@ func (c *Client) reserveSend(ctx context.Context, known bool) (ratelimit.Decisio
 		}
 	}
 	if c.store != nil {
-		return c.store.PersistentSendBudget(ctx, c.currentTime(), known, true)
+		return c.store.PersistentRecipientSendBudget(ctx, c.currentTime(), recipient, known, true)
 	}
 	return ratelimit.Decision{Allowed: true}, nil
 }
@@ -276,22 +289,16 @@ func (c *Client) processOutbox(ctx context.Context) {
 		return
 	}
 	known := c.IsKnownContact(jid)
-	if gate := c.sendGate(known); gate != nil {
-		c.health.mu.Lock()
-		state, until, healthReason := c.health.state, c.health.until, c.health.reason
-		c.health.mu.Unlock()
-		jobState := "blocked"
-		if state == HealthRestricted && !until.IsZero() && !strings.HasPrefix(healthReason, "circuit breaker:") {
-			jobState = "queued"
-		}
-		err = c.store.UpdateOutbox(ctx, j.JobID, jobState, gate.Error(), "", until)
+	if gate, state, next := c.outboxSafety(known); gate != nil {
+		err = c.store.UpdateOutbox(ctx, j.JobID, state, gate.Error(), "", next)
 		return
 	}
+
 	if !c.outboxConnected() {
 		err = c.store.UpdateOutbox(ctx, j.JobID, "queued", "transport disconnected before delivery; retry scheduled", "", now.Add(30*time.Second))
 		return
 	}
-	d, e := c.store.PersistentSendBudget(ctx, now, known, false)
+	d, e := c.store.PersistentRecipientSendBudget(ctx, now, c.recipientBudgetKey(jid), known, false)
 	if e != nil {
 		err = c.store.UpdateOutbox(ctx, j.JobID, "blocked", "persistent send protection failed: "+e.Error(), "", now)
 		return
@@ -336,15 +343,10 @@ func (c *Client) processOutbox(ctx context.Context) {
 				} else if _, definite := definiteRefusalCode(e); definite {
 					c.noteSendError(e)
 				}
-				if gate := c.sendGate(known); gate != nil && state != "failed" {
-					c.health.mu.Lock()
-					healthState, until, healthReason := c.health.state, c.health.until, c.health.reason
-					c.health.mu.Unlock()
-					state, reason = "blocked", "account safety blocked media preparation"
-					if healthState == HealthRestricted && !until.IsZero() && !strings.HasPrefix(healthReason, "circuit breaker:") {
-						state, reason, next = "queued", "media preparation waiting full account cooldown", until
-					}
+				if gate, gateState, gateNext := c.outboxSafety(known); gate != nil && state != "failed" {
+					state, reason, next = gateState, gate.Error(), gateNext
 				}
+
 				err = c.store.UpdateOutbox(saveCtx, j.JobID, state, reason, "", next)
 				return
 			}
@@ -364,8 +366,8 @@ func (c *Client) processOutbox(ctx context.Context) {
 	}
 	// Recheck health/transport after slow upload/presence; take budget at the
 	// actual network boundary, preserving minimum spacing for feature sends.
-	if e = c.sendGate(known); e != nil {
-		err = c.store.UpdateOutbox(ctx, j.JobID, "queued", e.Error(), "", c.currentTime().Add(time.Second))
+	if gate, state, next := c.outboxSafety(known); gate != nil {
+		err = c.store.UpdateOutbox(ctx, j.JobID, state, gate.Error(), "", next)
 		return
 	}
 	if c.pairedSender() != j.Sender {
@@ -383,7 +385,7 @@ func (c *Client) processOutbox(ctx context.Context) {
 	if !claimed {
 		return
 	}
-	d, e = c.reserveSend(ctx, known)
+	d, e = c.reserveRecipientSend(ctx, c.recipientBudgetKey(jid), known)
 	if e != nil {
 		err = c.store.UpdateOutbox(context.WithoutCancel(ctx), j.JobID, "blocked", e.Error(), "", now)
 		return
@@ -415,6 +417,11 @@ func (c *Client) processOutbox(ctx context.Context) {
 			jobState = "failed"
 			reason = "server refused delivery: " + e.Error()
 			if code == 429 || code == 463 || code == 475 {
+				// A stronger event may have arrived while the request was in flight.
+				if gate, temporary, _ := c.sendSafety(false); gate != nil && !temporary {
+					err = c.store.UpdateOutbox(saveCtx, j.JobID, "blocked", gate.Error(), "", c.currentTime())
+					return
+				}
 				c.health.mu.Lock()
 				next = c.health.until
 				c.health.mu.Unlock()
@@ -510,6 +517,9 @@ func (c *Client) initSendProtection(ctx context.Context) error {
 		c.health.lastErrAt = h.LastErrAt
 		c.health.lastErr = h.LastErr
 		c.health.lastOKAt = h.LastOKAt
+	}
+	if err := c.loadNativeRestriction(ctx); err != nil {
+		return err
 	}
 	c.healthPersistent = true
 	return nil

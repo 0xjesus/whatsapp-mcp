@@ -7,7 +7,6 @@ import (
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"google.golang.org/protobuf/proto"
-	"strings"
 	"time"
 
 	"github.com/sealjay/mcp-whatsapp/internal/store"
@@ -172,19 +171,17 @@ func (c *Client) sendScheduledNow(ctx context.Context, job store.ScheduledMessag
 		return reject("", 0, "scheduled authorization belongs to a different or unavailable sender")
 	}
 	known := c.IsKnownContact(jid)
-	if err = c.sendGate(known); err != nil {
-		c.health.mu.Lock()
-		until, state, reason := c.health.until, c.health.state, c.health.reason
-		c.health.mu.Unlock()
-		if state == HealthRestricted && !until.IsZero() && !strings.HasPrefix(reason, "circuit breaker:") {
-			return reject("rate_limit", until.Sub(c.currentTime()), err.Error())
+	if gate, temporary, next := c.sendSafety(known); gate != nil {
+		if temporary {
+			return reject("rate_limit", next.Sub(c.currentTime()), gate.Error())
 		}
-		return reject("", 0, err.Error())
+		return reject("", 0, gate.Error())
 	}
+
 	if !c.outboxConnected() {
 		return reject("offline", time.Minute, "transport disconnected")
 	}
-	if d, e := c.store.PersistentSendBudget(ctx, c.currentTime(), known, false); e != nil {
+	if d, e := c.store.PersistentRecipientSendBudget(ctx, c.currentTime(), c.recipientBudgetKey(jid), known, false); e != nil {
 		return reject("", 0, e.Error())
 	} else if !d.Allowed {
 		return reject("rate_limit", d.RetryAfter, d.Reason)
@@ -200,8 +197,11 @@ func (c *Client) sendScheduledNow(ctx context.Context, job store.ScheduledMessag
 	if ctx.Err() != nil || !c.outboxConnected() {
 		return reject("offline", time.Minute, "send context cancelled or disconnected")
 	}
-	if err = c.sendGate(known); err != nil {
-		return reject("", 0, "health changed before dispatch")
+	if gate, temporary, next := c.sendSafety(known); gate != nil {
+		if temporary {
+			return reject("rate_limit", next.Sub(c.currentTime()), gate.Error())
+		}
+		return reject("", 0, gate.Error())
 	}
 	id := job.MessageID
 	if id == "" {
@@ -210,7 +210,7 @@ func (c *Client) sendScheduledNow(ctx context.Context, job store.ScheduledMessag
 	if err = c.store.PrepareScheduledID(job.ID, id); err != nil {
 		return reject("", 0, err.Error())
 	}
-	d, e := c.reserveSend(ctx, known)
+	d, e := c.reserveRecipientSend(ctx, c.recipientBudgetKey(jid), known)
 	if e != nil {
 		return reject("", 0, e.Error())
 	}
@@ -235,6 +235,9 @@ func (c *Client) sendScheduledNow(ctx context.Context, job store.ScheduledMessag
 		c.noteSendError(err)
 		if code, definite := definiteRefusalCode(err); definite {
 			if code == 429 || code == 463 || code == 475 {
+				if gate, temporary, _ := c.sendSafety(false); gate != nil && !temporary {
+					return SendResult{BeforeNetwork: true, Message: "definite refusal with account state requiring review"}
+				}
 				c.health.mu.Lock()
 				until := c.health.until
 				c.health.mu.Unlock()

@@ -201,7 +201,9 @@ func (s *Store) confirmedOutgoing(ctx context.Context, id, recipient string) (bo
 	return n > 0, err
 }
 
-// EnsureSendProtection migrates the legacy ledger once, preserving hourly caps.
+// EnsureSendProtection imports retained legacy attempts once for hourly and daily caps.
+// Identity-less rows remain identity-less; activity already pruned by an older
+// daemon cannot be reconstructed from message history.
 // Its old reservation precedes typing, so allow a one-time 90-second cushion.
 // Only a missing legacy ledger requires the full-hour fallback.
 func (s *Store) EnsureSendProtection(ctx context.Context, now time.Time) error {
@@ -224,7 +226,7 @@ func (s *Store) EnsureSendProtection(ctx context.Context, now time.Time) error {
 	}
 	until := now.Add(time.Hour)
 	if available == 1 {
-		if _, err = tx.ExecContext(ctx, `INSERT INTO outbound_attempts(at_ns,known) SELECT at,known FROM send_budget WHERE at>?`, now.Add(-time.Hour).UnixNano()); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO outbound_attempts(at_ns,known) SELECT at,known FROM send_budget WHERE at>? OR rowid=(SELECT rowid FROM send_budget ORDER BY at DESC,rowid DESC LIMIT 1)`, now.Add(-24*time.Hour).UnixNano()); err != nil {
 			return err
 		}
 		until = now.Add(90 * time.Second)
@@ -244,81 +246,9 @@ func (s *Store) SetProtectionValue(ctx context.Context, key, value string) error
 	return err
 }
 
-// SendBudget checks or reserves the persistent shared budget. The process holds
-// its send mutex around reservations; the daemon's store lock excludes another
-// process. An attempted network send consumes budget even on uncertain failure.
+// PersistentSendBudget preserves callers without recipient identity. These
+// reservations still consume total and unknown-recipient budgets and charge
+// conservatively against every later identified recipient.
 func (s *Store) PersistentSendBudget(ctx context.Context, now time.Time, known, reserve bool) (ratelimit.Decision, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return ratelimit.Decision{}, err
-	}
-	defer tx.Rollback()
-	var guard int64
-	err = tx.QueryRowContext(ctx, `SELECT value FROM outbound_protection WHERE key='initial_guard'`).Scan(&guard)
-	if errors.Is(err, sql.ErrNoRows) {
-		return ratelimit.Decision{}, errors.New("persistent send protection not initialized")
-	}
-	if err != nil {
-		return ratelimit.Decision{}, err
-	}
-	if until := time.Unix(0, guard); now.Before(until) {
-		return ratelimit.Decision{RetryAfter: until.Sub(now), Reason: "initial persistent-protection migration cooldown"}, nil
-	}
-	var last sql.NullInt64
-	if err = tx.QueryRowContext(ctx, `SELECT MAX(at_ns) FROM outbound_attempts`).Scan(&last); err != nil {
-		return ratelimit.Decision{}, err
-	}
-	interval := 45 * time.Second
-	if !known {
-		interval = 90 * time.Second
-	}
-	if last.Valid && now.Before(time.Unix(0, last.Int64).Add(interval)) {
-		return ratelimit.Decision{RetryAfter: time.Unix(0, last.Int64).Add(interval).Sub(now), Reason: "minimum send interval not elapsed"}, nil
-	}
-	cutoff := now.Add(-time.Hour).UnixNano()
-	for _, cold := range []bool{false, true} {
-		if cold && known {
-			continue
-		}
-		query := `SELECT COUNT(*),MIN(at_ns) FROM outbound_attempts WHERE at_ns>?`
-		args := []any{cutoff}
-		cap := 30
-		if cold {
-			query += ` AND known=0`
-			cap = 15
-		}
-		var n int
-		var oldest sql.NullInt64
-		if err = tx.QueryRowContext(ctx, query, args...).Scan(&n, &oldest); err != nil {
-			return ratelimit.Decision{}, err
-		}
-		if n >= cap {
-			reason := "hourly send cap reached"
-			if cold {
-				reason = "hourly non-contact send cap reached"
-			}
-			return ratelimit.Decision{RetryAfter: time.Unix(0, oldest.Int64).Add(time.Hour).Sub(now), Reason: reason}, nil
-		}
-	}
-	if reserve {
-		if _, err = tx.ExecContext(ctx, `INSERT INTO outbound_attempts (at_ns,known) VALUES (?,?)`, now.UnixNano(), known); err != nil {
-			return ratelimit.Decision{}, err
-		}
-		// Keep legacy restoration/rollback history current in this same transaction.
-		// Both ledgers describe the same reservation; caps never sum the ledgers.
-		if _, err = tx.ExecContext(ctx, `INSERT INTO send_budget(at,known) VALUES(?,?)`, now.UnixNano(), known); err != nil {
-			return ratelimit.Decision{}, err
-		}
-		if _, err = tx.ExecContext(ctx, `DELETE FROM send_budget WHERE at<=?`, cutoff); err != nil {
-			return ratelimit.Decision{}, err
-		}
-		// Retain the most recent attempt for interval protection, even when old.
-		if _, err = tx.ExecContext(ctx, `DELETE FROM outbound_attempts WHERE at_ns<? AND rowid<>(SELECT MAX(rowid) FROM outbound_attempts)`, cutoff); err != nil {
-			return ratelimit.Decision{}, err
-		}
-	}
-	if err = tx.Commit(); err != nil {
-		return ratelimit.Decision{}, err
-	}
-	return ratelimit.Decision{Allowed: true}, nil
+	return s.PersistentRecipientSendBudget(ctx, now, "", known, reserve)
 }
