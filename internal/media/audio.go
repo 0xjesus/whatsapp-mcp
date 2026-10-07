@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"math/rand/v2"
 	"os"
@@ -28,21 +29,20 @@ func AnalyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 	var foundOpusHead bool
 
 	for i := 0; i < len(data); {
-		if i+27 >= len(data) {
-			break
+		if i+27 > len(data) {
+			return 0, nil, errors.New("truncated Ogg page header")
 		}
 
 		if string(data[i:i+4]) != "OggS" {
-			i++
-			continue
+			return 0, nil, errors.New("invalid Ogg page signature")
 		}
 
 		granulePos := binary.LittleEndian.Uint64(data[i+6 : i+14])
 		pageSeqNum := binary.LittleEndian.Uint32(data[i+18 : i+22])
 		numSegments := int(data[i+26])
 
-		if i+27+numSegments >= len(data) {
-			break
+		if i+27+numSegments > len(data) {
+			return 0, nil, errors.New("truncated Ogg segment table")
 		}
 		segmentTable := data[i+27 : i+27+numSegments]
 
@@ -51,16 +51,18 @@ func AnalyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 			pageSize += int(segLen)
 		}
 
+		if i+pageSize > len(data) {
+			return 0, nil, errors.New("truncated Ogg page payload")
+		}
 		if !foundOpusHead && pageSeqNum <= 1 {
-			pageData := data[i : i+pageSize]
+			pageData := data[i+27+numSegments : i+pageSize]
 			headPos := bytes.Index(pageData, []byte("OpusHead"))
-			if headPos >= 0 && headPos+12 < len(pageData) {
-				headPos += 8
-				if headPos+12 <= len(pageData) {
-					preSkip = binary.LittleEndian.Uint16(pageData[headPos+10 : headPos+12])
-					sampleRate = binary.LittleEndian.Uint32(pageData[headPos+12 : headPos+16])
-					foundOpusHead = true
+			if headPos >= 0 {
+				if headPos+19 > len(pageData) {
+					return 0, nil, errors.New("truncated Opus header")
 				}
+				preSkip = binary.LittleEndian.Uint16(pageData[headPos+10 : headPos+12])
+				foundOpusHead = true
 			}
 		}
 
@@ -71,7 +73,10 @@ func AnalyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 		i += pageSize
 	}
 
-	if lastGranule > 0 {
+	if !foundOpusHead {
+		return 0, nil, errors.New("missing Opus header")
+	}
+	if lastGranule > uint64(preSkip) {
 		durationSeconds := float64(lastGranule-uint64(preSkip)) / float64(sampleRate)
 		duration = uint32(math.Ceil(durationSeconds))
 	} else {
@@ -133,11 +138,46 @@ func PlaceholderWaveform(duration uint32) []byte {
 // writing the output to a temp file. Returns the temp file path. The caller
 // is responsible for removing the file.
 func ConvertToOpusOgg(ctx context.Context, inputPath string) (outputPath string, err error) {
+	return convertToOpusOgg(ctx, inputPath, "")
+}
+
+// ConvertSnapshotToOpusOgg converts already-authorized bytes using a private
+// directory. No conversion artifact is passed back through a public allowlist.
+func ConvertSnapshotToOpusOgg(ctx context.Context, data []byte, ext string) ([]byte, error) {
+	dir, err := os.MkdirTemp("", "whatsapp-voice-snapshot-*")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(dir)
+	input := filepath.Join(dir, "source"+filepath.Ext("source"+ext))
+	if err = os.WriteFile(input, data, 0600); err != nil {
+		return nil, err
+	}
+	output, err := convertToOpusOgg(ctx, input, dir)
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.Open(output)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	converted, err := io.ReadAll(io.LimitReader(f, 64*1024*1024+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(converted) == 0 || len(converted) > 64*1024*1024 {
+		return nil, errors.New("converted voice note must contain 1..64 MiB")
+	}
+	return converted, nil
+}
+
+func convertToOpusOgg(ctx context.Context, inputPath, outputDir string) (outputPath string, err error) {
 	if _, lookErr := exec.LookPath("ffmpeg"); lookErr != nil {
 		return "", errors.New("ffmpeg not found on PATH; install ffmpeg to use voice messages")
 	}
 
-	tmp, err := os.CreateTemp("", "mcp-whatsapp-audio-*.ogg")
+	tmp, err := os.CreateTemp(outputDir, "mcp-whatsapp-audio-*.ogg")
 	if err != nil {
 		return "", fmt.Errorf("failed to create temp file: %w", err)
 	}

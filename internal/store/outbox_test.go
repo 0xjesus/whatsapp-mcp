@@ -303,3 +303,122 @@ func TestPreSchemaLegacyAvailabilityControlsMigrationGuard(t *testing.T) {
 		})
 	}
 }
+
+func TestCancelUncertainOutboxRetainsDiagnostics(t *testing.T) {
+	s, e := Open(t.TempDir())
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	now := time.Now()
+	j := OutboxJob{JobID: "uncertain", MessageID: "stable", Recipient: "1@s.whatsapp.net", EnqueuedAt: now, NextAttempt: now, Payload: "private", Media: []byte("snapshot")}
+	if e = s.EnqueueOutbox(ctx, j); e != nil {
+		t.Fatal(e)
+	}
+	s.ClaimOutbox(ctx, j.JobID)
+	s.UpdateOutbox(ctx, j.JobID, "needs_review", "timeout after write; check stable ID", "", now)
+	if e = s.CancelOutbox(ctx, j.JobID); e == nil {
+		t.Fatal("uncertain job became ordinary cancelled")
+	}
+	got, _ := s.OutboxJob(ctx, j.JobID)
+	_, data, _ := s.LoadOutboxPayload(ctx, j.JobID)
+	if got.State != "needs_review" || got.Reason != "timeout after write; check stable ID" || string(data) != "snapshot" {
+		t.Fatalf("diagnostics lost: %+v %q", got, data)
+	}
+}
+
+func TestMappedLIDCacheRecoveryConstrainedToRecipientAndFromMe(t *testing.T) {
+	s, e := Open(t.TempDir())
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	now := time.Now()
+	// The synthetic mapping models whatsmeow.db; no dependency network calls.
+	if s.whatsmeowDB != nil {
+		s.whatsmeowDB.Close()
+	}
+	s.whatsmeowDB = s.DB()
+	s.DB().Exec(`CREATE TABLE whatsmeow_lid_map(lid TEXT PRIMARY KEY,pn TEXT);INSERT INTO whatsmeow_lid_map VALUES('99887766','447700000002')`)
+	for _, tc := range []struct {
+		id, chat string
+		fromMe   bool
+		sent     bool
+	}{{"mapped", "447700000002@s.whatsapp.net", true, true}, {"wrongchat", "999@s.whatsapp.net", true, false}, {"incoming", "447700000002@s.whatsapp.net", false, false}} {
+		j := OutboxJob{JobID: tc.id, MessageID: tc.id, Recipient: "99887766@lid", EnqueuedAt: now, NextAttempt: now, Payload: "private"}
+		if e = s.EnqueueOutbox(ctx, j); e != nil {
+			t.Fatal(e)
+		}
+		s.ClaimOutbox(ctx, j.JobID)
+		sj, e := s.Schedule("99887766@lid", "text", now.Add(time.Second), now.Add(time.Hour), tc.id)
+		if e != nil {
+			t.Fatal(e)
+		}
+		s.ClaimScheduled(now.Add(time.Second))
+		s.PrepareScheduledID(sj.ID, tc.id)
+		s.MarkScheduledDispatch(sj.ID)
+		s.StoreChat(tc.chat, "test", now)
+		s.StoreMessage(ctx, Message{ID: tc.id, ChatJID: tc.chat, Content: "text", IsFromMe: tc.fromMe, Timestamp: now}, nil, nil, nil, 0)
+	}
+	if e = s.RecoverOutbox(ctx); e != nil {
+		t.Fatal(e)
+	}
+	if e = s.RecoverScheduled(); e != nil {
+		t.Fatal(e)
+	}
+	for _, tc := range []struct{ id, state, status string }{{"mapped", "sent", "sent"}, {"wrongchat", "needs_review", "uncertain"}, {"incoming", "needs_review", "uncertain"}} {
+		j, _ := s.OutboxJob(ctx, tc.id)
+		if j.State != tc.state {
+			t.Fatalf("outbox %s: %+v", tc.id, j)
+		}
+		var status string
+		s.DB().QueryRow(`SELECT status FROM scheduled_messages WHERE idempotency_key=?`, tc.id).Scan(&status)
+		if status != tc.status {
+			t.Fatalf("scheduled %s: %s", tc.id, status)
+		}
+	}
+	// Avoid double Close on aliased test handles.
+	s.whatsmeowDB = nil
+}
+
+func TestCommittedOutboxAcceptanceSurvivesCancelledRefresh(t *testing.T) {
+	s, e := Open(t.TempDir())
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.afterOutboxInsert = cancel
+	now := time.Now()
+	j := OutboxJob{JobID: "committed", MessageID: "stable", Recipient: "1@s.whatsapp.net", State: "invented", EnqueuedAt: now, NextAttempt: now, Attempts: 7, Reason: "invented", SentID: "invented", Payload: "private", Media: []byte("private")}
+	got, e := s.EnqueueOutboxOnce(ctx, j)
+	if e != nil || got.JobID != j.JobID || got.State != "queued" || got.Attempts != 0 || got.Reason != "" || got.SentID != "" || got.Payload != "" || len(got.Media) != 0 {
+		t.Fatalf("committed insert falsely rejected or incorrect metadata: %+v %v", got, e)
+	}
+	persisted, e := s.OutboxJob(context.Background(), j.JobID)
+	if e != nil || persisted.JobID != got.JobID {
+		t.Fatalf("missing committed job: %+v %v", persisted, e)
+	}
+}
+
+func TestPersistentReservationKeepsLegacyRestoreLedgerCurrent(t *testing.T) {
+	s, e := Open(t.TempDir())
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	now := time.Now()
+	s.EnsureSendProtection(ctx, now.Add(-2*time.Hour))
+	d, e := s.PersistentSendBudget(ctx, now, false, true)
+	if e != nil || !d.Allowed {
+		t.Fatal(d, e)
+	}
+	all, cold, e := s.SendBudget()
+	if e != nil || len(all) != 1 || len(cold) != 1 || all[0].UnixNano() != now.UnixNano() {
+		t.Fatalf("legacy restoration misses new shared reservation: %v %v %v", all, cold, e)
+	}
+}

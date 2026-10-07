@@ -16,12 +16,9 @@ package client
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"math/rand"
 	"os"
-	"regexp"
-	"strings"
 	"sync"
 	"time"
 
@@ -54,8 +51,6 @@ type health struct {
 	lastErr         string
 	lastOKAt        time.Time
 }
-
-var serverCodeRe = regexp.MustCompile(`\b(4(?:0[1-3]|29|63|75)|5(?:0[03]|30))\b`)
 
 // setHealth records a non-OK state. until may be zero for open-ended states.
 func (c *Client) setHealth(state HealthState, until time.Time, reason string, allSends bool) {
@@ -139,15 +134,7 @@ func (c *Client) noteSendError(err error) {
 	c.persistHealthLocked()
 	h.mu.Unlock()
 
-	code := 0
-	var iq *whatsmeow.IQError
-	if errors.As(err, &iq) {
-		code = iq.Code
-	} else if errors.Is(err, whatsmeow.ErrServerReturnedError) || strings.Contains(err.Error(), "server returned error") {
-		if m := serverCodeRe.FindString(err.Error()); m != "" {
-			fmt.Sscanf(m, "%d", &code)
-		}
-	}
+	code, _ := definiteRefusalCode(err)
 	switch code {
 	case 463:
 		c.setHealth(HealthRestricted, now.Add(6*time.Hour), "reachout timelock (463): too many messages to new contacts", false)

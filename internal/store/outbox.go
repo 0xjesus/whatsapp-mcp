@@ -46,7 +46,15 @@ func (s *Store) EnqueueOutbox(ctx context.Context, j OutboxJob) error {
 func (s *Store) EnqueueOutboxOnce(ctx context.Context, j OutboxJob) (OutboxJob, error) {
 	err := s.EnqueueOutbox(ctx, j)
 	if err == nil {
-		return s.OutboxJob(ctx, j.JobID)
+		if s.afterOutboxInsert != nil {
+			s.afterOutboxInsert()
+		}
+		// INSERT is committed. Optional reads must not turn acceptance into rejection.
+		j.State, j.Attempts, j.Reason, j.SentID = "queued", 0, "", ""
+		j.Payload, j.Media = "", nil
+		j.EnqueuedAt = time.Unix(0, j.EnqueuedAt.UnixNano())
+		j.NextAttempt = time.Unix(0, j.NextAttempt.UnixNano())
+		return j, nil
 	}
 	if j.IdempotencyKey == "" {
 		return OutboxJob{}, err
@@ -133,7 +141,7 @@ func (s *Store) RecordOutboxAttempt(ctx context.Context, id string) error {
 	return err
 }
 func (s *Store) CancelOutbox(ctx context.Context, id string) error {
-	r, err := s.db.ExecContext(ctx, `UPDATE outbound_jobs SET state='cancelled',reason='cancelled by caller',media=NULL WHERE job_id=? AND state IN ('queued','blocked','needs_review')`, id)
+	r, err := s.db.ExecContext(ctx, `UPDATE outbound_jobs SET state='cancelled',reason='cancelled by caller',media=NULL WHERE job_id=? AND state IN ('queued','blocked')`, id)
 	if err != nil {
 		return err
 	}
@@ -142,17 +150,55 @@ func (s *Store) CancelOutbox(ctx context.Context, id string) error {
 		return err
 	}
 	if n != 1 {
-		return errors.New("job is absent, already terminal, or sending; cancellation refused")
+		return errors.New("job is absent, uncertain, already terminal, or sending; cancellation refused")
 	}
 	return nil
 }
 func (s *Store) RecoverOutbox(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE outbound_jobs SET
- state=CASE WHEN EXISTS(SELECT 1 FROM messages WHERE id=outbound_jobs.message_id AND chat_jid=outbound_jobs.recipient AND is_from_me=1) THEN 'sent' ELSE 'needs_review' END,
- sent_id=CASE WHEN EXISTS(SELECT 1 FROM messages WHERE id=outbound_jobs.message_id AND chat_jid=outbound_jobs.recipient AND is_from_me=1) THEN message_id ELSE '' END,
- reason='daemon interrupted delivery; check stable message ID before any new send'
- WHERE state='sending'`)
-	return err
+	rows, err := s.db.QueryContext(ctx, `SELECT `+outboxColumns+` FROM outbound_jobs WHERE state='sending'`)
+	if err != nil {
+		return err
+	}
+	var jobs []OutboxJob
+	for rows.Next() {
+		j, e := scanOutbox(rows)
+		if e != nil {
+			rows.Close()
+			return e
+		}
+		jobs = append(jobs, j)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	for _, j := range jobs {
+		confirmed, e := s.confirmedOutgoing(ctx, j.MessageID, j.Recipient)
+		if e != nil {
+			return e
+		}
+		state, sentID, reason := "needs_review", "", "daemon interrupted delivery; check stable message ID before any new send"
+		if confirmed {
+			state, sentID, reason = "sent", j.MessageID, "confirmed by outgoing cache after restart"
+		}
+		if _, err = s.db.ExecContext(ctx, `UPDATE outbound_jobs SET state=?,sent_id=?,reason=? WHERE job_id=? AND state='sending'`, state, sentID, reason, j.JobID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// confirmedOutgoing matches only this stable ID, an outgoing message, and the
+// submitted recipient or its recorded LID→phone mapping. Never ID alone.
+func (s *Store) confirmedOutgoing(ctx context.Context, id, recipient string) (bool, error) {
+	if id == "" {
+		return false, nil
+	}
+	canonical := s.ResolveLIDToJID(recipient)
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages WHERE id=? AND is_from_me=1 AND chat_jid IN (?,?)`, id, recipient, canonical).Scan(&n)
+	return n > 0, err
 }
 
 // EnsureSendProtection migrates the legacy ledger once, preserving hourly caps.
@@ -256,6 +302,14 @@ func (s *Store) PersistentSendBudget(ctx context.Context, now time.Time, known, 
 	}
 	if reserve {
 		if _, err = tx.ExecContext(ctx, `INSERT INTO outbound_attempts (at_ns,known) VALUES (?,?)`, now.UnixNano(), known); err != nil {
+			return ratelimit.Decision{}, err
+		}
+		// Keep legacy restoration/rollback history current in this same transaction.
+		// Both ledgers describe the same reservation; caps never sum the ledgers.
+		if _, err = tx.ExecContext(ctx, `INSERT INTO send_budget(at,known) VALUES(?,?)`, now.UnixNano(), known); err != nil {
+			return ratelimit.Decision{}, err
+		}
+		if _, err = tx.ExecContext(ctx, `DELETE FROM send_budget WHERE at<=?`, cutoff); err != nil {
 			return ratelimit.Decision{}, err
 		}
 		// Retain the most recent attempt for interval protection, even when old.

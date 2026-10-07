@@ -13,15 +13,22 @@ func (s *Server) registerOutboxTools() {
 	s.mcp.AddTool(get, mcp.NewTypedToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, a struct {
 		JobID string `json:"job_id"`
 		Limit int    `json:"limit"`
-	}) (*mcp.CallToolResult, error) { jobs, err := s.client.GetOutbox(ctx, a.JobID, a.Limit); if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}; return resultJSON(jobs) }))
+	}) (*mcp.CallToolResult, error) {
+		jobs, err := s.client.GetOutbox(ctx, a.JobID, a.Limit)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		return resultJSON(jobs)
+	}))
 	cancel := mcp.NewTool("cancel_outbox",
-		mcp.WithDescription("Cancel one queued, blocked or needs_review authorized job so it cannot start delivery. Refuses sending or already terminal jobs; cancelling needs_review does not prove it was never delivered. Does not revoke sent messages. Returns Cancelled and JobID."),
+		mcp.WithDescription("Cancel one queued or blocked authorized job so it cannot start delivery. Refuses sending, needs_review or already terminal jobs; uncertain delivery retains its original diagnostics. Does not revoke sent messages. Returns Cancelled and JobID."),
 		mcp.WithString("job_id", mcp.Required()), mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(false), mcp.WithIdempotentHintAnnotation(false), mcp.WithOpenWorldHintAnnotation(false))
 	s.mcp.AddTool(cancel, mcp.NewTypedToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, a struct {
 		JobID string `json:"job_id"`
-	}) (*mcp.CallToolResult, error) { if err := s.client.CancelOutbox(ctx, a.JobID); err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}; return resultJSON(map[string]any{"Cancelled": true, "JobID": a.JobID}) }))
+	}) (*mcp.CallToolResult, error) {
+		if err := s.client.CancelOutbox(ctx, a.JobID); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		return resultJSON(map[string]any{"Cancelled": true, "JobID": a.JobID})
+	}))
 }

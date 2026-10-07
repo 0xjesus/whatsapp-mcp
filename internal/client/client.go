@@ -71,6 +71,8 @@ type Client struct {
 	outboxOnce           sync.Once
 	senderIdentity       func() string // synthetic identity only in tests
 	clock                func() time.Time
+	uploadMedia          func(context.Context, []byte, whatsmeow.MediaType) (whatsmeow.UploadResponse, error)
+	preparationTimeout   time.Duration
 	networkSend          func(context.Context, types.JID, *waProto.Message, string) (whatsmeow.SendResponse, error)
 	healthPersistErr     error // guarded by health.mu; fails closed on disk errors
 	healthPersistent     bool

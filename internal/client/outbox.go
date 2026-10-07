@@ -101,6 +101,29 @@ func (c *Client) WaitOutbox() {
 }
 
 func (c *Client) enqueueSend(ctx context.Context, recipient string, p outboundPayload) SendResult {
+	opts, _ := ctx.Value(sendOptionsKey{}).(SendOptions)
+	p.MarkRead = opts.MarkRead
+	var data []byte
+	if p.MediaPath != "" {
+		path, err := c.ValidateMediaPath(p.MediaPath)
+		if err != nil {
+			return SendResult{Message: err.Error(), Status: "rejected"}
+		}
+		data, err = readMediaSnapshot(path)
+		if err != nil {
+			return SendResult{Message: err.Error(), Status: "rejected"}
+		}
+		p.MediaPath = filepath.Base(path)
+		if opts.MediaName != "" {
+			p.MediaPath = filepath.Base(opts.MediaName)
+		}
+	}
+	return c.enqueueSnapshot(ctx, recipient, p, data, nil)
+}
+
+// enqueueSnapshot is private: bytes come from an allowlisted file or a trusted
+// conversion of its immutable original bytes, never an arbitrary caller path.
+func (c *Client) enqueueSnapshot(ctx context.Context, recipient string, p outboundPayload, data, identity []byte) SendResult {
 	jid, err := parseRecipient(recipient)
 	if err != nil {
 		return SendResult{Message: err.Error(), Status: "rejected"}
@@ -114,32 +137,6 @@ func (c *Client) enqueueSend(ctx context.Context, recipient string, p outboundPa
 	}
 	opts, _ := ctx.Value(sendOptionsKey{}).(SendOptions)
 	p.MarkRead = opts.MarkRead
-	var data []byte
-	if p.MediaPath != "" {
-		path, err := c.ValidateMediaPath(p.MediaPath)
-		if err != nil {
-			return SendResult{Message: err.Error(), Status: "rejected"}
-		}
-		f, err := os.Open(path)
-		if err != nil {
-			return SendResult{Message: err.Error(), Status: "rejected"}
-		}
-		data, err = io.ReadAll(io.LimitReader(f, 64*1024*1024+1))
-		_ = f.Close()
-		if err != nil {
-			return SendResult{Message: err.Error(), Status: "rejected"}
-		}
-		if len(data) > 64*1024*1024 {
-			return SendResult{Message: "media exceeds durable queue limit of 64 MiB", Status: "rejected"}
-		}
-		if len(data) == 0 {
-			return SendResult{Message: "media file is empty", Status: "rejected"}
-		}
-		p.MediaPath = filepath.Base(path)
-		if opts.MediaName != "" {
-			p.MediaPath = filepath.Base(opts.MediaName)
-		}
-	}
 	payload, err := json.Marshal(p)
 	if err != nil {
 		return SendResult{Message: err.Error(), Status: "rejected"}
@@ -157,7 +154,10 @@ func (c *Client) enqueueSend(ctx context.Context, recipient string, p outboundPa
 	hash.Write([]byte{0})
 	hash.Write(payload)
 	hash.Write([]byte{0})
-	hash.Write(data)
+	if identity == nil {
+		identity = data
+	}
+	hash.Write(identity)
 	j.RequestHash = fmt.Sprintf("%x", hash.Sum(nil))
 	if j, err = c.store.EnqueueOutboxOnce(ctx, j); err != nil {
 		return SendResult{Message: "outbox persistence failed: " + err.Error(), Status: "rejected"}
@@ -191,6 +191,25 @@ func (c *Client) enqueueSend(ctx context.Context, recipient string, p outboundPa
 		}
 	}
 	return outboxResult(j)
+}
+
+func readMediaSnapshot(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, 64*1024*1024+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > 64*1024*1024 {
+		return nil, errors.New("media exceeds durable queue limit of 64 MiB")
+	}
+	if len(data) == 0 {
+		return nil, errors.New("media file is empty")
+	}
+	return data, nil
 }
 
 func outboxResult(j store.OutboxJob) SendResult {
@@ -299,12 +318,38 @@ func (c *Client) processOutbox(ctx context.Context) {
 			err = c.store.UpdateOutbox(ctx, j.JobID, "failed", "immutable media snapshot missing", "", now)
 			return
 		}
-		if c.networkSend == nil {
-			if e = c.attachMediaData(ctx, msg, p.MediaPath, j.Media, p.Body, p.ViewOnce); e != nil {
-				err = c.store.UpdateOutbox(ctx, j.JobID, "failed", e.Error(), "", now)
+		if c.networkSend == nil || c.uploadMedia != nil {
+			timeout := 90 * time.Second
+			if c.preparationTimeout > 0 {
+				timeout = c.preparationTimeout
+			}
+			prepCtx, cancel := context.WithTimeout(ctx, timeout)
+			e = c.attachMediaData(prepCtx, msg, p.MediaPath, j.Media, p.Body, p.ViewOnce)
+			cancel()
+			if e != nil {
+				saveCtx, saveCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				defer saveCancel()
+				state, reason, next := "queued", "media preparation failed before recipient dispatch; retry retained", c.currentTime().Add(30*time.Second)
+				var permanent *permanentMediaError
+				if errors.As(e, &permanent) {
+					state, reason = "failed", "invalid immutable media: "+e.Error()
+				} else if _, definite := definiteRefusalCode(e); definite {
+					c.noteSendError(e)
+				}
+				if gate := c.sendGate(known); gate != nil && state != "failed" {
+					c.health.mu.Lock()
+					healthState, until, healthReason := c.health.state, c.health.until, c.health.reason
+					c.health.mu.Unlock()
+					state, reason = "blocked", "account safety blocked media preparation"
+					if healthState == HealthRestricted && !until.IsZero() && !strings.HasPrefix(healthReason, "circuit breaker:") {
+						state, reason, next = "queued", "media preparation waiting full account cooldown", until
+					}
+				}
+				err = c.store.UpdateOutbox(saveCtx, j.JobID, state, reason, "", next)
 				return
 			}
 		}
+
 	} else if p.ReplyID != "" {
 		ci := &waProto.ContextInfo{StanzaID: proto.String(p.ReplyID)}
 		if p.ReplySender != "" {
@@ -366,11 +411,10 @@ func (c *Client) processOutbox(ctx context.Context) {
 	if e != nil {
 		c.noteSendError(e)
 		jobState, reason, next := "needs_review", "delivery uncertain: "+e.Error(), c.currentTime()
-		var iq *whatsmeow.IQError
-		if errors.As(e, &iq) {
+		if code, definite := definiteRefusalCode(e); definite {
 			jobState = "failed"
 			reason = "server refused delivery: " + e.Error()
-			if iq.Code == 429 || iq.Code == 463 || iq.Code == 475 {
+			if code == 429 || code == 463 || code == 475 {
 				c.health.mu.Lock()
 				next = c.health.until
 				c.health.mu.Unlock()
@@ -384,7 +428,7 @@ func (c *Client) processOutbox(ctx context.Context) {
 					jobState = "queued"
 					reason = "definite temporary server refusal; waiting full account cooldown: " + e.Error()
 				}
-			} else if iq.Code == 401 || iq.Code == 402 || iq.Code == 403 {
+			} else if code == 401 || code == 402 || code == 403 {
 				jobState = "blocked"
 			}
 		}

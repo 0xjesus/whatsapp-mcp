@@ -3,14 +3,10 @@ package mcp
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
-	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/sealjay/mcp-whatsapp/internal/client"
-	"github.com/sealjay/mcp-whatsapp/internal/media"
 )
 
 // registerSendTools wires outbound-message tools: send_message, send_file,
@@ -131,25 +127,8 @@ func (s *Server) registerSendAudioMessage() {
 			return mcp.NewToolResultError("recipient and media_path are required"), nil
 		}
 		ctx = withRateLimitOverride(ctx, req)
-		safePath, err := s.client.ValidateMediaPath(a.MediaPath)
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-		path := safePath
-		if !strings.HasSuffix(strings.ToLower(path), ".ogg") {
-			converted, err := media.ConvertToOpusOgg(ctx, path)
-			if err != nil {
-				return mcp.NewToolResultError(fmt.Sprintf("audio conversion failed: %v (install ffmpeg, or call send_file for raw audio)", err)), nil
-			}
-			defer os.Remove(converted)
-			path = converted
-		}
-		ctx = client.WithSendOptions(ctx, client.SendOptions{IdempotencyKey: a.IdempotencyKey, MarkRead: a.MarkChatRead, MediaName: strings.TrimSuffix(filepath.Base(safePath), filepath.Ext(safePath)) + ".ogg"})
-		r := s.client.SendMediaWithOptions(ctx, client.SendMediaOptions{
-			Recipient: a.Recipient,
-			MediaPath: path,
-			ViewOnce:  a.ViewOnce,
-		})
+		ctx = client.WithSendOptions(ctx, client.SendOptions{IdempotencyKey: a.IdempotencyKey, MarkRead: a.MarkChatRead})
+		r := s.client.SendAudioWithOptions(ctx, client.SendMediaOptions{Recipient: a.Recipient, MediaPath: a.MediaPath, ViewOnce: a.ViewOnce})
 		return resultJSON(r)
 	}))
 }

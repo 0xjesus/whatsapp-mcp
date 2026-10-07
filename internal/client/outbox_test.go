@@ -1,13 +1,17 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"github.com/sealjay/mcp-whatsapp/internal/media"
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/types"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -43,7 +47,7 @@ func TestOutbox429ResumesAtFullCooldownAndStopsAfterThree(t *testing.T) {
 	calls := 0
 	c.networkSend = func(_ context.Context, _ types.JID, _ *waProto.Message, id string) (whatsmeow.SendResponse, error) {
 		calls++
-		return whatsmeow.SendResponse{}, &whatsmeow.IQError{Code: 429}
+		return whatsmeow.SendResponse{}, fmt.Errorf("%w %d", whatsmeow.ErrServerReturnedError, 429)
 	}
 	r := c.Send(ctx, "447700000001", "authorized")
 	c.processOutbox(ctx)
@@ -288,5 +292,154 @@ func TestConvertedAudioRetryUsesStablePayloadName(t *testing.T) {
 		if r.JobID != id {
 			t.Fatal("conversion temp name produced duplicate")
 		}
+	}
+}
+
+func TestOutboxMediaPreparationRetainsBeforeRecipientDispatch(t *testing.T) {
+	for _, mode := range []string{"offline", "temporary", "cancelled", "deadline", "ban", "malformed"} {
+		t.Run(mode, func(t *testing.T) {
+			c, now := outboxTestClient(t)
+			root := t.TempDir()
+			c.allowedMediaRoot = root
+			path := filepath.Join(root, "image.png")
+			data := []byte("image")
+			if mode == "malformed" {
+				path = filepath.Join(root, "voice.ogg")
+				data = []byte("OggS")
+			}
+			os.WriteFile(path, data, 0600)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			online := true
+			c.online = func() bool { return online }
+			uploads, sends := 0, 0
+			c.preparationTimeout = 10 * time.Millisecond
+			c.uploadMedia = func(ctx context.Context, b []byte, _ whatsmeow.MediaType) (whatsmeow.UploadResponse, error) {
+				uploads++
+				if !bytes.Equal(b, data) {
+					t.Fatal("snapshot changed")
+				}
+				if uploads == 1 {
+					switch mode {
+					case "offline":
+						online = false
+						return whatsmeow.UploadResponse{}, errors.New("disconnected during upload")
+					case "temporary":
+						return whatsmeow.UploadResponse{}, errors.New("upload failed with status code 503")
+					case "cancelled":
+						cancel()
+						return whatsmeow.UploadResponse{}, context.Canceled
+					case "deadline":
+						<-ctx.Done()
+						return whatsmeow.UploadResponse{}, ctx.Err()
+					case "ban":
+						return whatsmeow.UploadResponse{}, fmt.Errorf("%w 402", whatsmeow.ErrServerReturnedError)
+					}
+				}
+				return whatsmeow.UploadResponse{URL: "https://example.invalid/snapshot", FileLength: uint64(len(b))}, nil
+			}
+			c.networkSend = func(_ context.Context, _ types.JID, m *waProto.Message, id string) (whatsmeow.SendResponse, error) {
+				sends++
+				if m.ImageMessage == nil {
+					t.Fatal("upload assembly bypassed")
+				}
+				return whatsmeow.SendResponse{ID: id}, nil
+			}
+			r := c.SendMediaWithOptions(context.Background(), SendMediaOptions{Recipient: "447700000001", MediaPath: path})
+			if !r.Accepted {
+				t.Fatal(r)
+			}
+			c.processOutbox(ctx)
+			j, _ := c.store.OutboxJob(context.Background(), r.JobID)
+			want := "queued"
+			if mode == "ban" {
+				want = "blocked"
+			}
+			if mode == "malformed" {
+				want = "failed"
+			}
+			if j.State != want || j.Attempts != 0 || sends != 0 {
+				t.Fatalf("pre-dispatch media lost/dispatched: %+v sends%d uploads%d", j, sends, uploads)
+			}
+			if mode == "malformed" && uploads != 0 {
+				t.Fatal("malformed media uploaded")
+			}
+			if want == "queued" {
+				online = true
+				c.preparationTimeout = time.Second
+				*now = j.NextAttempt
+				c.processOutbox(context.Background())
+				j, _ = c.store.OutboxJob(context.Background(), r.JobID)
+				if j.State != "sent" || j.Attempts != 1 || sends != 1 {
+					t.Fatalf("preparation did not resume: %+v sends%d", j, sends)
+				}
+			}
+		})
+	}
+}
+
+func TestRealConvertedAudioIdentityAndDefaultAllowlist(t *testing.T) {
+	if _, e := exec.LookPath("ffmpeg"); e != nil {
+		t.Skip("ffmpeg unavailable")
+	}
+	c, _ := outboxTestClient(t)
+	root := t.TempDir()
+	c.allowedMediaRoot = root
+	source := filepath.Join(root, "voice.wav")
+	makeWAV := func(freq string) {
+		t.Helper()
+		cmd := exec.Command("ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=frequency="+freq+":duration=0.1", "-y", source)
+		if out, e := cmd.CombinedOutput(); e != nil {
+			t.Fatalf("wav generation: %v %s", e, out)
+		}
+	}
+	makeWAV("440")
+	ctx := WithSendOptions(context.Background(), SendOptions{IdempotencyKey: "real-audio", MediaName: "voice.ogg"})
+	// Exercise real randomized Ogg muxing, not identical literal bytes.
+	a, e := media.ConvertToOpusOgg(context.Background(), source)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer os.Remove(a)
+	b, e := media.ConvertToOpusOgg(context.Background(), source)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer os.Remove(b)
+	aa, _ := os.ReadFile(a)
+	bb, _ := os.ReadFile(b)
+	if bytes.Equal(aa, bb) {
+		t.Fatal("fixture did not expose randomized conversion bytes")
+	}
+	// The public source passes allowlisting, but converted system-temp paths must
+	// never become an exception to public path validation.
+	if _, e = c.ValidateMediaPath(a); e == nil {
+		t.Fatal("conversion temp unexpectedly public")
+	}
+	r := c.SendAudioWithOptions(ctx, SendMediaOptions{Recipient: "447700000001", MediaPath: source, ViewOnce: true})
+	if !r.Accepted {
+		t.Fatal(r)
+	}
+	_, first, e := c.store.LoadOutboxPayload(context.Background(), r.JobID)
+	if e != nil || !bytes.HasPrefix(first, []byte("OggS")) {
+		t.Fatalf("converted snapshot missing: %v", e)
+	}
+	repeat := c.SendAudioWithOptions(ctx, SendMediaOptions{Recipient: "447700000001@s.whatsapp.net", MediaPath: source, ViewOnce: true})
+	if !repeat.Accepted || repeat.JobID != r.JobID {
+		t.Fatalf("same source changed authorization: %+v", repeat)
+	}
+	_, after, _ := c.store.LoadOutboxPayload(context.Background(), r.JobID)
+	if !bytes.Equal(first, after) {
+		t.Fatal("first immutable conversion replaced")
+	}
+	makeWAV("880")
+	changed := c.SendAudioWithOptions(ctx, SendMediaOptions{Recipient: "447700000001", MediaPath: source, ViewOnce: true})
+	if changed.Accepted {
+		t.Fatal("changed original audio reused authorization")
+	}
+	outside := filepath.Join(t.TempDir(), "voice.wav")
+	os.WriteFile(outside, []byte("outside"), 0600)
+	if got := c.SendAudioWithOptions(ctx, SendMediaOptions{Recipient: "447700000001", MediaPath: outside}); got.Accepted {
+		t.Fatal("outside source accepted")
 	}
 }

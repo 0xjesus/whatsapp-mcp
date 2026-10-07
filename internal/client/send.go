@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -122,12 +123,32 @@ func (c *Client) attachMedia(ctx context.Context, msg *waProto.Message, mediaPat
 	return c.attachMediaData(ctx, msg, safePath, mediaData, caption, viewOnce)
 }
 
+type permanentMediaError struct{ err error }
+
+func (e *permanentMediaError) Error() string { return e.err.Error() }
+func (e *permanentMediaError) Unwrap() error { return e.err }
+
 func (c *Client) attachMediaData(ctx context.Context, msg *waProto.Message, mediaPath string, mediaData []byte, caption string, viewOnce bool) error {
 	mediaType, mimeType := mediaTypeFromExt(mediaPath)
+	var seconds uint32 = 30
+	var waveform []byte
+	if mediaType == whatsmeow.MediaAudio && strings.Contains(mimeType, "ogg") {
+		var err error
+		seconds, waveform, err = media.AnalyzeOggOpus(mediaData)
+		if err != nil {
+			return &permanentMediaError{fmt.Errorf("invalid Ogg Opus media: %w", err)}
+		}
+	}
 
-	resp, err := c.wa.Upload(ctx, mediaData, mediaType)
+	var resp whatsmeow.UploadResponse
+	var err error
+	if c.uploadMedia != nil {
+		resp, err = c.uploadMedia(ctx, mediaData, mediaType)
+	} else {
+		resp, err = c.wa.Upload(ctx, mediaData, mediaType)
+	}
 	if err != nil {
-		return fmt.Errorf("Error uploading media: %v", err)
+		return fmt.Errorf("upload media: %w", err)
 	}
 	c.log.Infof("Media uploaded: url=%s bytes=%d", c.redactor.URL(resp.URL), resp.FileLength)
 
@@ -147,18 +168,6 @@ func (c *Client) attachMediaData(ctx context.Context, msg *waProto.Message, medi
 			msg.ImageMessage.ViewOnce = proto.Bool(true)
 		}
 	case whatsmeow.MediaAudio:
-		var seconds uint32 = 30
-		var waveform []byte
-		if strings.Contains(mimeType, "ogg") {
-			s, w, aerr := media.AnalyzeOggOpus(mediaData)
-			if aerr != nil {
-				return fmt.Errorf("Failed to analyze Ogg Opus file: %v", aerr)
-			}
-			seconds = s
-			waveform = w
-		} else {
-			c.log.Warnf("Not an Ogg Opus file: %s", mimeType)
-		}
 		msg.AudioMessage = &waProto.AudioMessage{
 			Mimetype:      proto.String(mimeType),
 			URL:           &resp.URL,
@@ -301,4 +310,36 @@ func (c *Client) persistSent(ctx context.Context, recipientJID types.JID, msgID,
 	}
 	c.log.Infof("[%s] -> %s [%s]: %s", now.Format("2006-01-02 15:04:05"), c.redactor.JID(chatJID), c.redactor.MsgID(msgID), c.redactor.Body(message))
 	return nil
+}
+
+// SendAudioWithOptions validates and snapshots the original voice-note source.
+// Idempotency is tied to original bytes and a fixed conversion policy, while
+// delivery always uses the first immutable converted snapshot stored in SQLite.
+func (c *Client) SendAudioWithOptions(ctx context.Context, opts SendMediaOptions) SendResult {
+	safe, err := c.ValidateMediaPath(opts.MediaPath)
+	if err != nil {
+		return SendResult{Status: "rejected", Message: err.Error()}
+	}
+	original, err := readMediaSnapshot(safe)
+	if err != nil {
+		return SendResult{Status: "rejected", Message: err.Error()}
+	}
+	name := strings.TrimSuffix(filepath.Base(safe), filepath.Ext(safe)) + ".ogg"
+	data := original
+	policy := "voice-note-ogg-original-v1"
+	if !strings.HasSuffix(strings.ToLower(safe), ".ogg") {
+		policy = "voice-note-opus-v1/libopus-32k-vbr-on-compression10"
+		conversionCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+		defer cancel()
+		data, err = media.ConvertSnapshotToOpusOgg(conversionCtx, original, filepath.Ext(safe))
+		if err != nil {
+			return SendResult{Status: "rejected", Message: fmt.Sprintf("audio conversion failed: %v", err)}
+		}
+	}
+	if _, _, err = media.AnalyzeOggOpus(data); err != nil {
+		return SendResult{Status: "rejected", Message: fmt.Sprintf("invalid voice-note media: %v", err)}
+	}
+	digest := sha256.Sum256(original)
+	identity := append([]byte(policy+"\x00"), digest[:]...)
+	return c.enqueueSnapshot(ctx, opts.Recipient, outboundPayload{MediaPath: name, Body: opts.Caption, ViewOnce: opts.ViewOnce}, data, identity)
 }

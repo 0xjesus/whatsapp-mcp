@@ -233,9 +233,8 @@ func (c *Client) sendScheduledNow(ctx context.Context, job store.ScheduledMessag
 	}
 	if err != nil {
 		c.noteSendError(err)
-		var iq *whatsmeow.IQError
-		if errors.As(err, &iq) {
-			if iq.Code == 429 || iq.Code == 463 || iq.Code == 475 {
+		if code, definite := definiteRefusalCode(err); definite {
+			if code == 429 || code == 463 || code == 475 {
 				c.health.mu.Lock()
 				until := c.health.until
 				c.health.mu.Unlock()

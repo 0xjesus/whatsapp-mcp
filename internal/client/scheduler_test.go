@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -174,7 +175,7 @@ func TestScheduledSenderDeadlineAndFiniteRefusals(t *testing.T) {
 	calls := 0
 	c.networkSend = func(_ context.Context, _ types.JID, _ *waProto.Message, id string) (whatsmeow.SendResponse, error) {
 		calls++
-		return whatsmeow.SendResponse{}, &whatsmeow.IQError{Code: 429}
+		return whatsmeow.SendResponse{}, fmt.Errorf("outer: %w", fmt.Errorf("%w %d", whatsmeow.ErrServerReturnedError, 429))
 	}
 	*now = real.Add(2 * time.Second)
 	for attempt := 1; attempt <= 3; attempt++ {

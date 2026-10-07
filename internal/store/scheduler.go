@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -180,8 +181,41 @@ func (s *Store) Reschedule(id string, send, expiry time.Time) error {
 	return requireScheduledChange(s.db.Exec(`UPDATE scheduled_messages SET send_at=?,expires_at=?,next_attempt=?,updated_at=? WHERE id=? AND status='pending'`, send.UnixNano(), expiry.UnixNano(), send.UnixNano(), time.Now().UnixNano(), id))
 }
 func (s *Store) RecoverScheduled() error {
-	_, err := s.db.Exec(`UPDATE scheduled_messages SET status=CASE WHEN status='claimed' THEN 'pending' WHEN message_id<>'' AND EXISTS(SELECT 1 FROM messages WHERE id=scheduled_messages.message_id AND chat_jid=scheduled_messages.chat_jid AND is_from_me=1) THEN 'sent' ELSE 'uncertain' END,error=CASE WHEN status='dispatching' THEN 'restart during network dispatch; check stable ID before resend' ELSE error END WHERE status IN ('claimed','dispatching')`)
-	return err
+	rows, err := s.db.Query(`SELECT ` + scheduledColumns + ` FROM scheduled_messages WHERE status IN ('claimed','dispatching')`)
+	if err != nil {
+		return err
+	}
+	var jobs []ScheduledMessage
+	for rows.Next() {
+		j, e := scanScheduled(rows)
+		if e != nil {
+			rows.Close()
+			return e
+		}
+		jobs = append(jobs, *j)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	for _, j := range jobs {
+		status, reason := "pending", j.Error
+		if j.Status == "dispatching" {
+			confirmed, e := s.confirmedOutgoing(context.Background(), j.MessageID, j.ChatJID)
+			if e != nil {
+				return e
+			}
+			status, reason = "uncertain", "restart during network dispatch; check stable ID before resend"
+			if confirmed {
+				status, reason = "sent", "confirmed by outgoing cache after restart"
+			}
+		}
+		if _, err = s.db.Exec(`UPDATE scheduled_messages SET status=?,error=? WHERE id=? AND status=?`, status, reason, j.ID, j.Status); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // PrepareScheduledID persists the network ID while the scheduler still owns the job.

@@ -85,9 +85,10 @@ type MessageContext struct {
 
 // Store handles the message cache and read-only access to whatsmeow's DB.
 type Store struct {
-	db          *sql.DB
-	whatsmeowDB *sql.DB
-	dir         string
+	afterOutboxInsert func() // deterministic post-commit cancellation seam in tests
+	db                *sql.DB
+	whatsmeowDB       *sql.DB
+	dir               string
 }
 
 // Open creates (if necessary) the store directory and opens both databases.
