@@ -25,7 +25,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sealjay/mcp-whatsapp/internal/ratelimit"
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/types"
@@ -63,7 +62,8 @@ func (c *Client) setHealth(state HealthState, until time.Time, reason string, al
 	h := &c.health
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.state, h.until, h.reason, h.allSends, h.setAt = state, until, reason, allSends, time.Now()
+	h.state, h.until, h.reason, h.allSends, h.setAt = state, until, reason, allSends, c.currentTime()
+	c.persistHealthLocked()
 	c.log.Errorf("ACCOUNT HEALTH → %s (%s) until=%s allSends=%v", state, reason, fmtUntil(until), allSends)
 }
 
@@ -73,13 +73,14 @@ func (c *Client) clearHealth(why string) {
 	h := &c.health
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if (h.state == HealthRestricted || h.state == HealthTempBanned) && (h.until.IsZero() || time.Now().Before(h.until)) {
+	if (h.state == HealthRestricted || h.state == HealthTempBanned) && (h.until.IsZero() || c.currentTime().Before(h.until)) {
 		return
 	}
 	if h.state != HealthOK && h.state != "" {
 		c.log.Infof("ACCOUNT HEALTH → ok (%s)", why)
 	}
 	h.state, h.until, h.reason, h.allSends = HealthOK, time.Time{}, "", false
+	c.persistHealthLocked()
 }
 
 func fmtUntil(t time.Time) string {
@@ -95,12 +96,16 @@ func (c *Client) sendGate(isContact bool) error {
 	h := &c.health
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if c.healthPersistErr != nil {
+		return fmt.Errorf("SEND BLOCKED: health persistence failed: %w", c.healthPersistErr)
+	}
 	if h.state == "" || h.state == HealthOK {
 		return nil
 	}
-	if !h.until.IsZero() && time.Now().After(h.until) {
+	if !h.until.IsZero() && !c.currentTime().Before(h.until) {
 		c.log.Infof("ACCOUNT HEALTH → ok (restriction %q expired)", h.reason)
 		h.state, h.until, h.reason, h.allSends = HealthOK, time.Time{}, "", false
+		c.persistHealthLocked()
 		return nil
 	}
 	switch h.state {
@@ -122,7 +127,7 @@ func (c *Client) noteSendError(err error) {
 	if err == nil {
 		return
 	}
-	now := time.Now()
+	now := c.currentTime()
 	h := &c.health
 	h.mu.Lock()
 	if now.Sub(h.lastErrAt) > 10*time.Minute {
@@ -131,6 +136,7 @@ func (c *Client) noteSendError(err error) {
 	h.consecutiveErrs++
 	h.lastErrAt, h.lastErr = now, err.Error()
 	consecutive := h.consecutiveErrs
+	c.persistHealthLocked()
 	h.mu.Unlock()
 
 	code := 0
@@ -166,7 +172,8 @@ func (c *Client) noteSendOK() {
 	h := &c.health
 	h.mu.Lock()
 	h.consecutiveErrs = 0
-	h.lastOKAt = time.Now()
+	h.lastOKAt = c.currentTime()
+	c.persistHealthLocked()
 	h.mu.Unlock()
 }
 
@@ -187,7 +194,7 @@ func (c *Client) HealthSnapshot() map[string]any {
 	if state == "" {
 		state = HealthOK
 	}
-	if state != HealthOK && !h.until.IsZero() && time.Now().After(h.until) {
+	if state != HealthOK && !h.until.IsZero() && !c.currentTime().Before(h.until) {
 		state = HealthOK
 	}
 	out := map[string]any{"state": state, "humanize": os.Getenv("WHATSAPP_MCP_HUMANIZE") != "0"}
@@ -266,17 +273,13 @@ func (c *Client) sendFeatureMessage(ctx context.Context, recipient types.JID, ms
 	if err := c.mutationGate(recipient.String()); err != nil {
 		return whatsmeow.SendResponse{}, err
 	}
-	if c.limiter != nil && !ratelimit.BypassFromContext(ctx) {
-		known := recipient.Server == types.GroupServer || (c.store != nil && c.IsKnownContact(recipient))
-		if d := c.limiter.AllowSend(known); !d.Allowed {
-			return whatsmeow.SendResponse{}, fmt.Errorf("rate limited: %s — retry in %s (set the X-Rate-Limit-Override header to bypass)", d.Reason, d.RetryAfter.Round(time.Second))
-		}
+	known := recipient.Server == types.GroupServer || (c.store != nil && c.IsKnownContact(recipient))
+	d, err := c.reserveSend(ctx, known)
+	if err != nil {
+		return whatsmeow.SendResponse{}, err
 	}
-	if c.limiter != nil && !ratelimit.BypassFromContext(ctx) && c.store != nil {
-		known := recipient.Server == types.GroupServer || c.IsKnownContact(recipient)
-		if err := c.store.RecordSendBudget(known); err != nil {
-			return whatsmeow.SendResponse{}, fmt.Errorf("cannot persist send safety budget")
-		}
+	if !d.Allowed {
+		return whatsmeow.SendResponse{}, fmt.Errorf("rate limited: %s — retry in %s", d.Reason, d.RetryAfter.Round(time.Second))
 	}
 	resp, err := c.wa.SendMessage(ctx, recipient, msg)
 	c.noteMutationResult(err)

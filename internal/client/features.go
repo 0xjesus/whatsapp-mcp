@@ -121,51 +121,20 @@ func (c *Client) SendReaction(ctx context.Context, chatJID, messageID, senderJID
 }
 
 // SendReply sends a text reply that quotes targetMessageID from chatJID.
-func (c *Client) SendReply(ctx context.Context, chatJID, targetMessageID, targetSenderJID, body string) error {
-	if err := c.mutationGate(chatJID); err != nil {
-		return err
+// SendReply returns the durable send contract, including queued JobID.
+func (c *Client) SendReply(ctx context.Context, chatJID, targetMessageID, targetSenderJID, body string) SendResult {
+	if targetMessageID == "" {
+		return SendResult{Status: "rejected", Message: "target_message_id is required"}
 	}
-	if !c.wa.IsConnected() {
-		return errors.New("not connected to WhatsApp")
-	}
-	chat, err := types.ParseJID(chatJID)
-	if err != nil {
-		return fmt.Errorf("invalid chat JID: %w", err)
-	}
-	if gerr := c.sendGate(c.IsKnownContact(chat)); gerr != nil {
-		return gerr
-	}
-
-	participant := ""
-	if targetSenderJID != "" {
-		// ContextInfo.Participant expects a JID string for group quotes.
-		if sender, perr := types.ParseJID(targetSenderJID); perr == nil {
-			participant = sender.ToNonAD().String()
-		} else {
-			participant = targetSenderJID
-		}
-	}
-
-	ctxInfo := &waProto.ContextInfo{
-		StanzaID: proto.String(targetMessageID),
-	}
+	participant := targetSenderJID
 	if participant != "" {
-		ctxInfo.Participant = proto.String(participant)
+		jid, err := parseRecipient(participant)
+		if err != nil {
+			return SendResult{Status: "rejected", Message: err.Error()}
+		}
+		participant = jid.ToNonAD().String()
 	}
-
-	msg := &waProto.Message{
-		ExtendedTextMessage: &waProto.ExtendedTextMessage{
-			Text:        proto.String(body),
-			ContextInfo: ctxInfo,
-		},
-		MessageContextInfo: c.ephemeralContextInfo(ctx, chat),
-	}
-
-	c.humanizeBeforeSend(ctx, chat, len(body), false)
-	if _, err := c.sendFeatureMessage(ctx, chat, msg); err != nil {
-		return fmt.Errorf("send reply: %w", err)
-	}
-	return nil
+	return c.enqueueSend(ctx, chatJID, outboundPayload{Body: body, ReplyID: targetMessageID, ReplySender: participant})
 }
 
 // EditMessage edits a previously-sent message. The new body becomes the new

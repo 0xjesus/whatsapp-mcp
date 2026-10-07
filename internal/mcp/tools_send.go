@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -22,19 +23,22 @@ func (s *Server) registerSendTools() {
 	s.registerSendReaction()
 	s.registerSendReply()
 	s.registerSendTyping()
+	s.registerOutboxTools()
 }
 
 // -- send_message -----------------------------------------------------------
 
 type sendMessageArgs struct {
-	Recipient    string `json:"recipient"`
-	Message      string `json:"message"`
-	MarkChatRead bool   `json:"mark_chat_read,omitempty"`
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
+	Recipient      string `json:"recipient"`
+	Message        string `json:"message"`
+	MarkChatRead   bool   `json:"mark_chat_read,omitempty"`
 }
 
 func (s *Server) registerSendMessage() {
 	tool := mcp.NewTool("send_message",
-		mcp.WithDescription("Send a new WhatsApp text message to a person or group; recipients see it as a fresh message from the paired account and the row is also stored in the local cache. Reversible via delete_message (revoke) or edit_message (correct text); to quote a previous message use send_reply, for emoji acknowledgement use send_reaction. Returns a JSON object `{Success, Message, ID}` where `ID` is the WhatsApp message ID on success."),
+		mcp.WithString("idempotency_key", mcp.Description("optional unique authorization key; exact retries return the same job, changed content is rejected")),
+		mcp.WithDescription("Send a new WhatsApp text message to a person or group; recipients see it as a fresh message from the paired account and the row is also stored in the local cache. Reversible via delete_message (revoke) or edit_message (correct text); to quote a previous message use send_reply, for emoji acknowledgement use send_reaction. Returns `{Success, Accepted, Status, JobID, Message, ID}`. Success and ID confirm delivery. Accepted queued/sending jobs are durably retained and automatically paced; do not repeat them. Use get_outbox with JobID or cancel_outbox. Local pacing differs from an account restriction; the daemon enforces both across restarts."),
 		mcp.WithString("recipient", mcp.Required(), mcp.Description(recipientDesc)),
 		mcp.WithString("message", mcp.Required(), mcp.Description("message body text")),
 		mcp.WithBoolean("mark_chat_read", mcp.DefaultBool(false), mcp.Description("if true, also ack recent incoming messages in the chat to clear the unread badge (defaults to false)")),
@@ -48,8 +52,8 @@ func (s *Server) registerSendMessage() {
 			return mcp.NewToolResultError("recipient must be provided"), nil
 		}
 		ctx = withRateLimitOverride(ctx, req)
+		ctx = client.WithSendOptions(ctx, client.SendOptions{IdempotencyKey: a.IdempotencyKey, MarkRead: a.MarkChatRead})
 		r := s.client.Send(ctx, a.Recipient, a.Message)
-		s.maybeMarkChatRead(ctx, r, a.Recipient, a.MarkChatRead)
 		return resultJSON(r)
 	}))
 }
@@ -57,16 +61,18 @@ func (s *Server) registerSendMessage() {
 // -- send_file --------------------------------------------------------------
 
 type sendFileArgs struct {
-	Recipient    string `json:"recipient"`
-	MediaPath    string `json:"media_path"`
-	Caption      string `json:"caption,omitempty"`
-	MarkChatRead bool   `json:"mark_chat_read,omitempty"`
-	ViewOnce     bool   `json:"view_once,omitempty"`
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
+	Recipient      string `json:"recipient"`
+	MediaPath      string `json:"media_path"`
+	Caption        string `json:"caption,omitempty"`
+	MarkChatRead   bool   `json:"mark_chat_read,omitempty"`
+	ViewOnce       bool   `json:"view_once,omitempty"`
 }
 
 func (s *Server) registerSendFile() {
 	tool := mcp.NewTool("send_file",
-		mcp.WithDescription("Upload and send a picture, video, document, or raw audio attachment via WhatsApp; the recipient sees a media message and the outgoing row is persisted to the local cache. Reversible via delete_message (revoke). For voice notes use send_audio_message (which transcodes to ogg/opus); for plain text use send_message. Returns a JSON object `{Success, Message, ID}` where `ID` is the WhatsApp message ID on success."),
+		mcp.WithString("idempotency_key", mcp.Description("optional unique authorization key; exact retries return the same job, changed content is rejected")),
+		mcp.WithDescription("Upload and send a picture, video, document, or raw audio attachment via WhatsApp; the recipient sees a media message and the outgoing row is persisted to the local cache. Reversible via delete_message (revoke). For voice notes use send_audio_message (which transcodes to ogg/opus); for plain text use send_message. Returns `{Success, Accepted, Status, JobID, Message, ID}`. Success and ID confirm delivery. Accepted queued/sending jobs are durably retained and automatically paced; do not repeat them. Use get_outbox with JobID or cancel_outbox. Local pacing differs from an account restriction; the daemon enforces both across restarts."),
 		mcp.WithString("recipient", mcp.Required(), mcp.Description(recipientDesc)),
 		mcp.WithString("media_path", mcp.Required(), mcp.Description("absolute path to the media file; must sit under the configured media root (`WHATSAPP_MCP_MEDIA_ROOT`, default `<store>/uploads/`)")),
 		mcp.WithString("caption", mcp.Description("optional caption for image/video/document submessages; ignored for raw audio")),
@@ -86,13 +92,13 @@ func (s *Server) registerSendFile() {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		ctx = withRateLimitOverride(ctx, req)
+		ctx = client.WithSendOptions(ctx, client.SendOptions{IdempotencyKey: a.IdempotencyKey, MarkRead: a.MarkChatRead})
 		r := s.client.SendMediaWithOptions(ctx, client.SendMediaOptions{
 			Recipient: a.Recipient,
 			Caption:   a.Caption,
 			MediaPath: safePath,
 			ViewOnce:  a.ViewOnce,
 		})
-		s.maybeMarkChatRead(ctx, r, a.Recipient, a.MarkChatRead)
 		return resultJSON(r)
 	}))
 }
@@ -100,15 +106,17 @@ func (s *Server) registerSendFile() {
 // -- send_audio_message -----------------------------------------------------
 
 type sendAudioArgs struct {
-	Recipient    string `json:"recipient"`
-	MediaPath    string `json:"media_path"`
-	MarkChatRead bool   `json:"mark_chat_read,omitempty"`
-	ViewOnce     bool   `json:"view_once,omitempty"`
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
+	Recipient      string `json:"recipient"`
+	MediaPath      string `json:"media_path"`
+	MarkChatRead   bool   `json:"mark_chat_read,omitempty"`
+	ViewOnce       bool   `json:"view_once,omitempty"`
 }
 
 func (s *Server) registerSendAudioMessage() {
 	tool := mcp.NewTool("send_audio_message",
-		mcp.WithDescription("Send an audio file as a WhatsApp voice note (waveform UI, push-to-play); non-ogg inputs are transcoded via ffmpeg before upload. Reversible via delete_message (revoke). Use send_file when you want the audio delivered as a regular attachment instead of a voice note. Prerequisites: ffmpeg must be on PATH for non-ogg inputs. Returns a JSON object `{Success, Message, ID}` where `ID` is the WhatsApp message ID on success."),
+		mcp.WithString("idempotency_key", mcp.Description("optional unique authorization key; exact retries return the same job, changed content is rejected")),
+		mcp.WithDescription("Send an audio file as a WhatsApp voice note (waveform UI, push-to-play); non-ogg inputs are transcoded via ffmpeg before upload. Reversible via delete_message (revoke). Use send_file when you want the audio delivered as a regular attachment instead of a voice note. Prerequisites: ffmpeg must be on PATH for non-ogg inputs. Returns `{Success, Accepted, Status, JobID, Message, ID}`. Success and ID confirm delivery. Accepted queued/sending jobs are durably retained and automatically paced; do not repeat them. Use get_outbox with JobID or cancel_outbox. Local pacing differs from an account restriction; the daemon enforces both across restarts."),
 		mcp.WithString("recipient", mcp.Required(), mcp.Description(recipientDesc)),
 		mcp.WithString("media_path", mcp.Required(), mcp.Description("absolute path to the audio file; must sit under the configured media root (`WHATSAPP_MCP_MEDIA_ROOT`, default `<store>/uploads/`)")),
 		mcp.WithBoolean("mark_chat_read", mcp.DefaultBool(false), mcp.Description("if true, also ack recent incoming messages in the chat to clear the unread badge (defaults to false)")),
@@ -136,12 +144,12 @@ func (s *Server) registerSendAudioMessage() {
 			defer os.Remove(converted)
 			path = converted
 		}
+		ctx = client.WithSendOptions(ctx, client.SendOptions{IdempotencyKey: a.IdempotencyKey, MarkRead: a.MarkChatRead, MediaName: strings.TrimSuffix(filepath.Base(safePath), filepath.Ext(safePath)) + ".ogg"})
 		r := s.client.SendMediaWithOptions(ctx, client.SendMediaOptions{
 			Recipient: a.Recipient,
 			MediaPath: path,
 			ViewOnce:  a.ViewOnce,
 		})
-		s.maybeMarkChatRead(ctx, r, a.Recipient, a.MarkChatRead)
 		return resultJSON(r)
 	}))
 }
@@ -178,6 +186,7 @@ func (s *Server) registerSendReaction() {
 // -- send_reply -------------------------------------------------------------
 
 type sendReplyArgs struct {
+	IdempotencyKey  string `json:"idempotency_key,omitempty"`
 	ChatJID         string `json:"chat_jid"`
 	TargetMessageID string `json:"target_message_id"`
 	TargetSenderJID string `json:"target_sender_jid,omitempty"`
@@ -186,7 +195,8 @@ type sendReplyArgs struct {
 
 func (s *Server) registerSendReply() {
 	tool := mcp.NewTool("send_reply",
-		mcp.WithDescription("Send a text message that visibly quotes a previous message; recipients see the new text with the quoted message attached. Reversible via delete_message (revoke) or edit_message (correct text). Use send_message for a fresh non-quoting message and send_reaction for an emoji acknowledgement. Returns the plain-text string `Reply sent` on success."),
+		mcp.WithString("idempotency_key", mcp.Description("optional unique authorization key; exact retries return the same job, changed content is rejected")),
+		mcp.WithDescription("Send a text message that visibly quotes a previous message; recipients see the new text with the quoted message attached. Reversible via delete_message (revoke) or edit_message (correct text). Use send_message for a fresh non-quoting message and send_reaction for an emoji acknowledgement. Returns the durable send JSON contract `{Success, Accepted, Status, JobID, Message, ID}`; queued acceptance is not delivery. Do not resubmit an accepted job; inspect get_outbox or cancel_outbox."),
 		mcp.WithString("chat_jid", mcp.Required(), mcp.Description(jidDesc)),
 		mcp.WithString("target_message_id", mcp.Required(), mcp.Description("WhatsApp message ID of the message being quoted (use `message_id` from list_messages)")),
 		mcp.WithString("target_sender_jid", mcp.Description("JID of the quoted message's original sender; required in group chats, omit in 1:1 chats ("+jidDesc+")")),
@@ -197,10 +207,8 @@ func (s *Server) registerSendReply() {
 		mcp.WithOpenWorldHintAnnotation(true),
 	)
 	s.mcp.AddTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, a sendReplyArgs) (*mcp.CallToolResult, error) {
-		if err := s.client.SendReply(ctx, a.ChatJID, a.TargetMessageID, a.TargetSenderJID, a.Body); err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-		return mcp.NewToolResultText("Reply sent"), nil
+		ctx = client.WithSendOptions(ctx, client.SendOptions{IdempotencyKey: a.IdempotencyKey})
+		return resultJSON(s.client.SendReply(ctx, a.ChatJID, a.TargetMessageID, a.TargetSenderJID, a.Body))
 	}))
 }
 

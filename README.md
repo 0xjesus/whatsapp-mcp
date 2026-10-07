@@ -15,6 +15,8 @@ Parte de [Sealjay/mcp-whatsapp](https://github.com/Sealjay/mcp-whatsapp), basado
 
 <a id="what-this-fork-adds"></a>
 
+Los envíos aceptados se guardan en una cola durable. Consulta `get_outbox` y usa `cancel_outbox`; `idempotency_key` permite repetir la misma autorización sin duplicarla. La migración conserva el presupuesto horario existente y espera hasta 90 segundos antes de despachar.
+
 - **Buscar por lo que recuerdas.** Encuentra conversaciones por su significado, aunque no recuerdes las palabras exactas. Combina búsqueda semántica y búsqueda de texto.
 - **Buscar dentro de imágenes y documentos.** Extrae texto de imágenes, PDF, Word, Excel y presentaciones, y lo incorpora al índice. Puede interpretar imágenes y documentos con OpenAI, conservar el texto original y controlar el gasto con un presupuesto mensual y caché. También admite visión local; los análisis incompletos quedan identificados.
 - **Elegir qué grupos monitorear.** Autoriza grupos individualmente o activa la regla automática de hasta 10 integrantes. Los grupos más grandes o de tamaño desconocido quedan apagados; tus decisiones manuales tienen prioridad.

@@ -108,9 +108,18 @@ func Open(dir string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open messages db: %w", err)
 	}
+	var legacyLedgerAvailable int
+	if err = db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='send_budget'`).Scan(&legacyLedgerAvailable); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if _, err := db.Exec(schema + schedulerSchema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
+	}
+	if _, err = db.Exec(`INSERT OR IGNORE INTO outbound_protection(key,value) VALUES('legacy_ledger_available',?)`, legacyLedgerAvailable); err != nil {
+		db.Close()
+		return nil, err
 	}
 	if err := migrateSchema(db); err != nil {
 		db.Close()
@@ -289,6 +298,16 @@ func (s *Store) RecentIncomingMessages(ctx context.Context, chatJID string, limi
 }
 
 const schema = `
+CREATE TABLE IF NOT EXISTS outbound_jobs (
+ job_id TEXT PRIMARY KEY, message_id TEXT NOT NULL UNIQUE, recipient TEXT NOT NULL,
+ state TEXT NOT NULL, enqueued_ns INTEGER NOT NULL, next_ns INTEGER NOT NULL,
+ attempts INTEGER NOT NULL DEFAULT 0, reason TEXT NOT NULL DEFAULT '',
+ sent_id TEXT NOT NULL DEFAULT '', sender TEXT NOT NULL DEFAULT '', idempotency_key TEXT NOT NULL DEFAULT '', request_hash TEXT NOT NULL DEFAULT '', payload TEXT NOT NULL, media BLOB
+);
+CREATE TABLE IF NOT EXISTS outbound_protection (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS outbound_attempts (at_ns INTEGER NOT NULL, known INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS outbound_attempts_by_time ON outbound_attempts(at_ns);
+
 CREATE TABLE IF NOT EXISTS view_once_media (
  id TEXT NOT NULL, chat_jid TEXT NOT NULL, sender_jid TEXT NOT NULL, state TEXT NOT NULL,
  path TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT '', requested_at INTEGER NOT NULL DEFAULT 0,
@@ -356,6 +375,44 @@ CREATE TABLE IF NOT EXISTS message_mutations (
 // any ALTER. Every step is idempotent — running migrateSchema twice is a
 // no-op on an up-to-date DB.
 func migrateSchema(db *sql.DB) error {
+	var schedulerExists int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='scheduled_messages'`).Scan(&schedulerExists); err != nil {
+		return err
+	}
+	if schedulerExists == 1 {
+		var senderColumn int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('scheduled_messages') WHERE name='sender'`).Scan(&senderColumn); err != nil {
+			return err
+		}
+		if senderColumn == 0 {
+			if _, err := db.Exec(`ALTER TABLE scheduled_messages ADD COLUMN sender TEXT NOT NULL DEFAULT ''`); err != nil {
+				return err
+			}
+		}
+
+	}
+	var outboxExists int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='outbound_jobs'`).Scan(&outboxExists); err != nil {
+		return err
+	}
+	if outboxExists > 0 {
+		// Upgrade partial outbox databases before installing the unique key index.
+		for _, column := range []string{"sender", "idempotency_key", "request_hash"} {
+			var found int
+			if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('outbound_jobs') WHERE name=?`, column).Scan(&found); err != nil {
+				return err
+			}
+			if found == 0 {
+				if _, err := db.Exec("ALTER TABLE outbound_jobs ADD COLUMN " + column + " TEXT NOT NULL DEFAULT ''"); err != nil {
+					return err
+				}
+			}
+		}
+		if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS outbound_idempotency ON outbound_jobs(idempotency_key) WHERE idempotency_key<>''`); err != nil {
+			return err
+		}
+
+	}
 	rows, err := db.Query("PRAGMA table_info(messages)")
 	if err != nil {
 		return fmt.Errorf("pragma table_info(messages): %w", err)

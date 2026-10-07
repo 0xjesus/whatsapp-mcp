@@ -6,6 +6,9 @@ import (
 	"time"
 
 	"github.com/sealjay/mcp-whatsapp/internal/store"
+	"go.mau.fi/whatsmeow"
+	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/types"
 )
 
 func scheduledTestClient(t *testing.T) (*Client, *store.Store) {
@@ -124,5 +127,92 @@ func TestMonitoringGenerationRejectsStaleSnapshot(t *testing.T) {
 	}
 	if s.MonitoringAllowed("123@g.us") {
 		t.Fatal("over threshold")
+	}
+}
+
+func TestScheduledUsesSynchronousDeliveryAndSharedBudget(t *testing.T) {
+	c, now := outboxTestClient(t)
+	ctx := context.Background()
+	j, e := c.store.Schedule("123@s.whatsapp.net", "scheduled", time.Now().Add(time.Second), time.Now().Add(time.Hour), "", c.pairedSender())
+	if e != nil {
+		t.Fatal(e)
+	}
+	calls := 0
+	c.networkSend = func(_ context.Context, _ types.JID, _ *waProto.Message, id string) (whatsmeow.SendResponse, error) {
+		calls++
+		return whatsmeow.SendResponse{ID: id}, nil
+	}
+	c.store.PersistentSendBudget(ctx, *now, false, true)
+	c.runScheduled(ctx, time.Now().Add(2*time.Second))
+	jobs, _ := c.store.ListScheduled(100, "", "pending")
+	out, _ := c.GetOutbox(ctx, "", 100)
+	if len(jobs) != 1 || calls != 0 || len(out) != 0 {
+		t.Fatalf("throttle orphan: jobs=%+v out=%+v calls=%d", jobs, out, calls)
+	}
+	*now = now.Add(90 * time.Second)
+	c.runScheduled(ctx, time.Now().Add(2*time.Minute))
+	jobs, _ = c.store.ListScheduled(100, "", "sent")
+	if len(jobs) != 1 || jobs[0].ID != j.ID || jobs[0].MessageID == "" || calls != 1 {
+		t.Fatalf("scheduled resume: %+v calls=%d", jobs, calls)
+	}
+	r := c.Send(ctx, "123@s.whatsapp.net", "immediate")
+	c.processOutbox(ctx)
+	o, _ := c.store.OutboxJob(ctx, r.JobID)
+	if calls != 1 || o.State != "queued" {
+		t.Fatalf("shared limit: %+v calls=%d", o, calls)
+	}
+}
+
+func TestScheduledSenderDeadlineAndFiniteRefusals(t *testing.T) {
+	c, now := outboxTestClient(t)
+	ctx := context.Background()
+	real := time.Now()
+	j, e := c.store.Schedule("123@s.whatsapp.net", "scheduled", real.Add(time.Second), real.Add(time.Hour*3), "", c.pairedSender())
+	if e != nil {
+		t.Fatal(e)
+	}
+	calls := 0
+	c.networkSend = func(_ context.Context, _ types.JID, _ *waProto.Message, id string) (whatsmeow.SendResponse, error) {
+		calls++
+		return whatsmeow.SendResponse{}, &whatsmeow.IQError{Code: 429}
+	}
+	*now = real.Add(2 * time.Second)
+	for attempt := 1; attempt <= 3; attempt++ {
+		c.runScheduled(ctx, *now)
+		jobs, _ := c.store.ListScheduled(100, "", "")
+		if len(jobs) != 1 {
+			t.Fatal(jobs)
+		}
+		got := jobs[0]
+		if attempt < 3 {
+			if got.Status != "pending" || got.NextAttempt.Sub(*now) != time.Duration(attempt)*30*time.Minute {
+				t.Fatalf("attempt%d: %+v", attempt, got)
+			}
+			*now = got.NextAttempt
+		} else if got.Status != "failed" || got.Attempts != 3 {
+			t.Fatalf("exhausted: %+v", got)
+		}
+	}
+	if calls != 3 {
+		t.Fatal(calls)
+	}
+	// A changed sender cannot inherit an old authorization.
+	j, e = c.store.Schedule("123@s.whatsapp.net", "sender test", real.Add(time.Second), real.Add(time.Hour), "", c.pairedSender())
+	if e != nil {
+		t.Fatal(e)
+	}
+	c.senderIdentity = func() string { return "different@s.whatsapp.net" }
+	c.runScheduled(ctx, real.Add(time.Second*2))
+	jobs, _ := c.store.ListScheduled(100, "", "failed")
+	if len(jobs) != 2 || calls != 3 {
+		t.Fatalf("sender %+v calls%d", jobs, calls)
+	}
+	// Cancelled caller context returns before the network boundary.
+	c.senderIdentity = func() string { return j.Sender }
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	r := c.sendScheduledNow(cancelled, *j)
+	if !r.BeforeNetwork || calls != 3 {
+		t.Fatal(r, calls)
 	}
 }

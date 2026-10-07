@@ -15,7 +15,6 @@ import (
 	"go.mau.fi/whatsmeow/types"
 
 	"github.com/sealjay/mcp-whatsapp/internal/media"
-	"github.com/sealjay/mcp-whatsapp/internal/ratelimit"
 	"github.com/sealjay/mcp-whatsapp/internal/store"
 )
 
@@ -27,6 +26,9 @@ type SendResult struct {
 	BeforeNetwork bool          `json:"-"`
 	RetryAfter    time.Duration `json:"-"`
 	FailureKind   string        `json:"-"`
+	Accepted      bool
+	Status        string
+	JobID         string
 }
 
 // SendMediaOptions bundles the inputs to SendMediaWithOptions so callers can
@@ -50,85 +52,7 @@ func (c *Client) SendMediaWithOptions(ctx context.Context, opts SendMediaOptions
 
 // send is the unified implementation shared by Send and SendMediaWithOptions.
 func (c *Client) send(ctx context.Context, recipient, message, mediaPath string, viewOnce bool) SendResult {
-	c.sendMu.Lock()
-	defer c.sendMu.Unlock()
-	if !c.wa.IsConnected() {
-		return SendResult{Success: false, BeforeNetwork: true, FailureKind: "offline", RetryAfter: time.Minute, Message: "Not connected to WhatsApp"}
-	}
-
-	recipientJID, err := parseRecipient(recipient)
-	if err != nil {
-		return SendResult{Success: false, BeforeNetwork: true, Message: err.Error()}
-	}
-
-	// Daemon-side rate limit — defense-in-depth against a client (or the LLM
-	// driving it) fanning out sends faster than WhatsApp tolerates. The
-	// operator override rides on a context value the MCP layer only sets when
-	// the request carried the X-Rate-Limit-Override header, which the model
-	// cannot forge.
-	isContact := c.IsKnownContact(recipientJID)
-	if gerr := c.sendGate(isContact); gerr != nil {
-		c.log.Warnf("send to %s refused by health gate: %v", c.redactor.JID(recipientJID.String()), gerr)
-		return SendResult{Success: false, BeforeNetwork: true, Message: gerr.Error()}
-	}
-	if c.limiter != nil {
-		if ratelimit.BypassFromContext(ctx) {
-			c.log.Warnf("RATE LIMIT OVERRIDE: send to %s bypassed the limiter via X-Rate-Limit-Override", c.redactor.JID(recipientJID.String()))
-		} else {
-			if d := c.limiter.AllowSend(isContact); !d.Allowed {
-				c.log.Warnf("Rate limited: send to %s denied (%s); retry in %s", c.redactor.JID(recipientJID.String()), d.Reason, d.RetryAfter.Round(time.Second))
-				return SendResult{Success: false, BeforeNetwork: true, FailureKind: "rate_limit", RetryAfter: d.RetryAfter, Message: fmt.Sprintf(
-					"rate limited: %s — retry in %s (set the X-Rate-Limit-Override header to bypass; see the daemon rate-limit docs)",
-					d.Reason, d.RetryAfter.Round(time.Second))}
-			}
-		}
-	}
-
-	if c.limiter != nil && !ratelimit.BypassFromContext(ctx) && c.store != nil {
-		if err := c.store.RecordSendBudget(isContact); err != nil {
-			return SendResult{BeforeNetwork: true, Message: "cannot persist send safety budget"}
-		}
-	}
-	// Detect disappearing timer for group chats; direct chats default to 0.
-	msg := &waProto.Message{
-		MessageContextInfo: c.ephemeralContextInfo(ctx, recipientJID),
-	}
-
-	if mediaPath != "" {
-		if err := c.attachMedia(ctx, msg, mediaPath, message, viewOnce); err != nil {
-			return SendResult{Success: false, BeforeNetwork: true, Message: err.Error()}
-		}
-	} else {
-		msg.Conversation = proto.String(message)
-	}
-
-	c.humanizeBeforeSend(ctx, recipientJID, len(message), msg.AudioMessage != nil)
-	if ctx.Err() != nil {
-		return SendResult{BeforeNetwork: true, FailureKind: "offline", RetryAfter: time.Minute, Message: "send context cancelled"}
-	}
-	if hook, ok := ctx.Value(scheduledDispatchKey{}).(func() error); ok {
-		if err := c.sendGate(c.IsKnownContact(recipientJID)); err != nil {
-			return SendResult{BeforeNetwork: true, Message: "send safety changed before scheduled dispatch"}
-		}
-		if err := hook(); err != nil {
-			return SendResult{BeforeNetwork: true, Message: "scheduled dispatch state changed"}
-		}
-	}
-	resp, err := c.wa.SendMessage(ctx, recipientJID, msg)
-	if err != nil {
-		c.noteSendError(err)
-		return SendResult{Success: false, Message: fmt.Sprintf("Error sending message: %v", err)}
-	}
-	c.noteSendOK()
-
-	// Cache the sent message so local history stays complete.
-	c.persistSent(ctx, recipientJID, resp.ID, message, mediaPath, msg)
-
-	return SendResult{
-		Success: true,
-		Message: fmt.Sprintf("Message sent to %s", recipient),
-		ID:      resp.ID,
-	}
+	return c.enqueueSend(ctx, recipient, outboundPayload{Body: message, MediaPath: mediaPath, ViewOnce: viewOnce})
 }
 
 // ephemeralContextInfo returns the MessageContextInfo carrying the group's
@@ -195,7 +119,11 @@ func (c *Client) attachMedia(ctx context.Context, msg *waProto.Message, mediaPat
 		return fmt.Errorf("read media file: %w", err)
 	}
 
-	mediaType, mimeType := mediaTypeFromExt(safePath)
+	return c.attachMediaData(ctx, msg, safePath, mediaData, caption, viewOnce)
+}
+
+func (c *Client) attachMediaData(ctx context.Context, msg *waProto.Message, mediaPath string, mediaData []byte, caption string, viewOnce bool) error {
+	mediaType, mimeType := mediaTypeFromExt(mediaPath)
 
 	resp, err := c.wa.Upload(ctx, mediaData, mediaType)
 	if err != nil {
@@ -324,13 +252,16 @@ func mediaTypeFromExt(path string) (whatsmeow.MediaType, string) {
 
 // persistSent writes a cache row for a message we sent so the local history
 // stays complete regardless of device multiplexing.
-func (c *Client) persistSent(ctx context.Context, recipientJID types.JID, msgID, message, mediaPath string, msg *waProto.Message) {
+func (c *Client) persistSent(ctx context.Context, recipientJID types.JID, msgID, message, mediaPath string, msg *waProto.Message) error {
 	chatJID := recipientJID.String()
 	if !strings.HasSuffix(chatJID, "@g.us") {
 		chatJID = c.store.ResolveLIDToJID(chatJID)
 	}
 
-	chatName := c.resolveChatNameFallback(ctx, recipientJID, "")
+	chatName := c.store.FindChatName(chatJID)
+	if c.networkSend == nil {
+		chatName = c.resolveChatNameFallback(ctx, recipientJID, "")
+	}
 
 	now := time.Now()
 	if err := c.store.StoreChat(chatJID, chatName, now); err != nil {
@@ -338,7 +269,7 @@ func (c *Client) persistSent(ctx context.Context, recipientJID types.JID, msgID,
 	}
 
 	ourJID := ""
-	if c.wa.Store.ID != nil {
+	if c.wa != nil && c.wa.Store != nil && c.wa.Store.ID != nil {
 		ourJID = c.wa.Store.ID.User
 	}
 
@@ -366,7 +297,8 @@ func (c *Client) persistSent(ctx context.Context, recipientJID types.JID, msgID,
 	}, storedMediaKey, storedFileSHA256, storedFileEnc, storedFileLength)
 	if err != nil {
 		c.log.Warnf("Failed to store sent message: %v", err)
-		return
+		return err
 	}
 	c.log.Infof("[%s] -> %s [%s]: %s", now.Format("2006-01-02 15:04:05"), c.redactor.JID(chatJID), c.redactor.MsgID(msgID), c.redactor.Body(message))
+	return nil
 }
