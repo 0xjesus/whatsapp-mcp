@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -14,12 +15,13 @@ CREATE TABLE IF NOT EXISTS scheduled_messages(
  send_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,next_attempt INTEGER NOT NULL,
  idempotency_key TEXT UNIQUE,status TEXT NOT NULL DEFAULT 'pending',
  attempts INTEGER NOT NULL DEFAULT 0,message_id TEXT NOT NULL DEFAULT '',error TEXT NOT NULL DEFAULT '',
- created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
+ created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,sender TEXT NOT NULL DEFAULT '');
 CREATE INDEX IF NOT EXISTS scheduled_due ON scheduled_messages(status,next_attempt,id);
 CREATE TABLE IF NOT EXISTS send_budget(at INTEGER NOT NULL,known INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS send_budget_time ON send_budget(at);`
 
 type ScheduledMessage struct {
+	Sender         string    `json:"sender,omitempty"`
 	ID             string    `json:"job_id"`
 	ChatJID        string    `json:"chat_jid"`
 	Text           string    `json:"text"`
@@ -33,14 +35,14 @@ type ScheduledMessage struct {
 	Error          string    `json:"error,omitempty"`
 }
 
-const scheduledColumns = `id,chat_jid,text,send_at,expires_at,next_attempt,COALESCE(idempotency_key,''),status,attempts,message_id,error`
+const scheduledColumns = `id,chat_jid,text,send_at,expires_at,next_attempt,COALESCE(idempotency_key,''),status,attempts,message_id,error,sender`
 
 type scheduledScanner interface{ Scan(...interface{}) error }
 
 func scanScheduled(row scheduledScanner) (*ScheduledMessage, error) {
 	var j ScheduledMessage
 	var id, send, expiry, next int64
-	err := row.Scan(&id, &j.ChatJID, &j.Text, &send, &expiry, &next, &j.IdempotencyKey, &j.Status, &j.Attempts, &j.MessageID, &j.Error)
+	err := row.Scan(&id, &j.ChatJID, &j.Text, &send, &expiry, &next, &j.IdempotencyKey, &j.Status, &j.Attempts, &j.MessageID, &j.Error, &j.Sender)
 	if err != nil {
 		return nil, err
 	}
@@ -62,7 +64,7 @@ func validateSchedule(text string, send, expiry time.Time) error {
 	}
 	return nil
 }
-func (s *Store) Schedule(chat, text string, send, expiry time.Time, key string) (*ScheduledMessage, error) {
+func (s *Store) Schedule(chat, text string, send, expiry time.Time, key string, sender ...string) (*ScheduledMessage, error) {
 	if err := validateSchedule(text, send, expiry); err != nil {
 		return nil, err
 	}
@@ -77,7 +79,7 @@ func (s *Store) Schedule(chat, text string, send, expiry time.Time, key string) 
 	if key != "" {
 		j, e := scanScheduled(tx.QueryRow(`SELECT `+scheduledColumns+` FROM scheduled_messages WHERE idempotency_key=?`, key))
 		if e == nil {
-			if j.ChatJID != chat || j.Text != text || j.SendAt.UnixNano() != send.UnixNano() || j.ExpiresAt.UnixNano() != expiry.UnixNano() {
+			if j.ChatJID != chat || j.Text != text || j.SendAt.UnixNano() != send.UnixNano() || j.ExpiresAt.UnixNano() != expiry.UnixNano() || (len(sender) > 0 && j.Sender != sender[0]) {
 				return nil, errors.New("idempotency_key already used with different parameters")
 			}
 			return j, nil
@@ -100,8 +102,12 @@ func (s *Store) Schedule(chat, text string, send, expiry time.Time, key string) 
 	if key != "" {
 		nullableKey = key
 	}
+	own := ""
+	if len(sender) > 0 {
+		own = sender[0]
+	}
 	now := time.Now().UnixNano()
-	r, err := tx.Exec(`INSERT INTO scheduled_messages(chat_jid,text,send_at,expires_at,next_attempt,idempotency_key,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)`, chat, text, send.UnixNano(), expiry.UnixNano(), send.UnixNano(), nullableKey, now, now)
+	r, err := tx.Exec(`INSERT INTO scheduled_messages(chat_jid,text,send_at,expires_at,next_attempt,idempotency_key,created_at,updated_at,sender) VALUES(?,?,?,?,?,?,?,?,?)`, chat, text, send.UnixNano(), expiry.UnixNano(), send.UnixNano(), nullableKey, now, now, own)
 	if err != nil {
 		return nil, err
 	}
@@ -175,14 +181,55 @@ func (s *Store) Reschedule(id string, send, expiry time.Time) error {
 	return requireScheduledChange(s.db.Exec(`UPDATE scheduled_messages SET send_at=?,expires_at=?,next_attempt=?,updated_at=? WHERE id=? AND status='pending'`, send.UnixNano(), expiry.UnixNano(), send.UnixNano(), time.Now().UnixNano(), id))
 }
 func (s *Store) RecoverScheduled() error {
-	_, err := s.db.Exec(`UPDATE scheduled_messages SET status=CASE WHEN status='dispatching' THEN 'uncertain' ELSE 'pending' END,error=CASE WHEN status='dispatching' THEN 'restart during network dispatch; manual review required' ELSE error END WHERE status IN ('claimed','dispatching')`)
-	return err
+	rows, err := s.db.Query(`SELECT ` + scheduledColumns + ` FROM scheduled_messages WHERE status IN ('claimed','dispatching')`)
+	if err != nil {
+		return err
+	}
+	var jobs []ScheduledMessage
+	for rows.Next() {
+		j, e := scanScheduled(rows)
+		if e != nil {
+			rows.Close()
+			return e
+		}
+		jobs = append(jobs, *j)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	for _, j := range jobs {
+		status, reason := "pending", j.Error
+		if j.Status == "dispatching" {
+			confirmed, e := s.confirmedOutgoing(context.Background(), j.MessageID, j.ChatJID)
+			if e != nil {
+				return e
+			}
+			status, reason = "uncertain", "restart during network dispatch; check stable ID before resend"
+			if confirmed {
+				status, reason = "sent", "confirmed by outgoing cache after restart"
+			}
+		}
+		if _, err = s.db.Exec(`UPDATE scheduled_messages SET status=?,error=? WHERE id=? AND status=?`, status, reason, j.ID, j.Status); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// PrepareScheduledID persists the network ID while the scheduler still owns the job.
+func (s *Store) PrepareScheduledID(id, messageID string) error {
+	return requireScheduledChange(s.db.Exec(`UPDATE scheduled_messages SET message_id=CASE WHEN message_id='' THEN ? ELSE message_id END WHERE id=? AND status='claimed'`, messageID, id))
 }
 func (s *Store) ClaimScheduled(now time.Time) (*ScheduledMessage, error) {
 	if _, err := s.db.Exec(`DELETE FROM scheduled_messages WHERE id IN (SELECT id FROM scheduled_messages WHERE status IN ('sent','cancelled','expired','failed') AND updated_at<? ORDER BY updated_at LIMIT 100)`, now.Add(-7*24*time.Hour).UnixNano()); err != nil {
 		return nil, err
 	}
 	if _, err := s.db.Exec(`UPDATE scheduled_messages SET status='expired',error='delivery deadline passed',updated_at=? WHERE status='pending' AND expires_at<=?`, now.UnixNano(), now.UnixNano()); err != nil {
+		return nil, err
+	}
+	if _, err := s.db.Exec(`UPDATE scheduled_messages SET status='failed',error='delivery attempt limit reached; manual review required',updated_at=? WHERE status='pending' AND attempts>=5`, now.UnixNano()); err != nil {
 		return nil, err
 	}
 	j, err := scanScheduled(s.db.QueryRow(`UPDATE scheduled_messages SET status='claimed',updated_at=? WHERE id=(SELECT id FROM scheduled_messages WHERE status='pending' AND next_attempt<=? AND send_at<=? AND expires_at>? AND attempts<5 ORDER BY next_attempt,id LIMIT 1) AND status='pending' RETURNING `+scheduledColumns, now.UnixNano(), now.UnixNano(), now.UnixNano(), now.UnixNano()))
@@ -200,7 +247,7 @@ func (s *Store) FinishScheduled(id, status, messageID, reason string, next time.
 	default:
 		return fmt.Errorf("invalid finish status %q", status)
 	}
-	return requireScheduledChange(s.db.Exec(`UPDATE scheduled_messages SET status=?,message_id=?,error=?,next_attempt=?,updated_at=? WHERE id=? AND status IN ('claimed','dispatching')`, status, messageID, reason, next.UnixNano(), time.Now().UnixNano(), id))
+	return requireScheduledChange(s.db.Exec(`UPDATE scheduled_messages SET status=?,message_id=CASE WHEN ?='' THEN message_id ELSE ? END,error=?,next_attempt=?,updated_at=? WHERE id=? AND status IN ('claimed','dispatching')`, status, messageID, messageID, reason, next.UnixNano(), time.Now().UnixNano(), id))
 }
 
 // SendBudget loads the bounded trailing-hour ledger for restoring the rate guard.
@@ -242,4 +289,13 @@ func (s *Store) RecordSendBudget(known bool) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// BindLegacyScheduledSender upgrades pre-outbox authorizations once at startup.
+func (s *Store) BindLegacyScheduledSender(sender string) error {
+	if sender == "" {
+		return nil
+	}
+	_, err := s.db.Exec(`UPDATE scheduled_messages SET sender=? WHERE sender='' AND status IN ('pending','claimed')`, sender)
+	return err
 }

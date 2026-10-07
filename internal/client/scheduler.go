@@ -3,6 +3,10 @@ package client
 import (
 	"context"
 	"errors"
+	"fmt"
+	"go.mau.fi/whatsmeow"
+	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"google.golang.org/protobuf/proto"
 	"time"
 
 	"github.com/sealjay/mcp-whatsapp/internal/store"
@@ -23,7 +27,11 @@ func (c *Client) ScheduleMessage(chat, text, sendAt, expiresAt, key string) (*st
 	if err != nil {
 		return nil, err
 	}
-	return c.store.Schedule(jid.String(), text, send, expiry, key)
+	sender := c.pairedSender()
+	if sender == "" {
+		return nil, errors.New("paired sender unavailable")
+	}
+	return c.store.Schedule(jid.String(), text, send, expiry, key, sender)
 }
 func scheduledTimes(sendAt, expiresAt string) (time.Time, time.Time, error) {
 	send, err := time.Parse(time.RFC3339, sendAt)
@@ -58,6 +66,9 @@ func (c *Client) CancelScheduledMessage(id string) error { return c.store.Cancel
 func (c *Client) StartScheduler(ctx context.Context) error {
 	var startErr error
 	c.schedulerOnce.Do(func() {
+		if startErr = c.store.BindLegacyScheduledSender(c.pairedSender()); startErr != nil {
+			return
+		}
 		if startErr = c.store.RecoverScheduled(); startErr != nil {
 			return
 		}
@@ -92,7 +103,7 @@ func (c *Client) runScheduled(ctx context.Context, now time.Time) {
 	sendCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	sendCtx = context.WithValue(sendCtx, scheduledDispatchKey{}, func() error { return c.store.MarkScheduledDispatch(job.ID) })
-	sender := c.Send
+	sender := func(ctx context.Context, chat, text string) SendResult { return c.sendScheduledNow(ctx, *job) }
 	if c.scheduledSend != nil {
 		sender = c.scheduledSend
 	}
@@ -101,6 +112,15 @@ func (c *Client) runScheduled(ctx context.Context, now time.Time) {
 	next := now
 	if result.Success {
 		status, reason, messageID = "sent", "", result.ID
+	} else if result.FailureKind == "temporary_refusal" {
+		status, reason = "failed", "definite server refusal; attempt limit reached"
+		if job.Attempts+1 < 3 {
+			next = c.currentTime().Add(result.RetryAfter)
+			status, reason = "pending", "waiting full account cooldown after definite refusal"
+			if !next.Before(job.ExpiresAt) {
+				status, reason = "expired", "cooldown exceeds delivery deadline"
+			}
+		}
 	} else if result.BeforeNetwork {
 		status, reason = "failed", "send rejected by safety gate before network dispatch"
 		if result.FailureKind == "rate_limit" || result.FailureKind == "offline" {
@@ -109,7 +129,7 @@ func (c *Client) runScheduled(ctx context.Context, now time.Time) {
 				delay = time.Second
 			}
 			// Never shorten RetryAfter. Jobs expire rather than bypassing a long cooldown.
-			next = time.Now().Add(delay)
+			next = c.currentTime().Add(delay)
 			status, reason = "pending", "waiting for send safety cooldown"
 			if !next.Before(job.ExpiresAt) {
 				status, reason = "expired", "cooldown exceeds delivery deadline"
@@ -129,4 +149,116 @@ func (c *Client) StopScheduler() {
 		c.schedulerCancel()
 		<-c.schedulerDone
 	}
+}
+
+// sendScheduledNow keeps the scheduler as sole durable owner and shares the
+// outbox dispatch mutex/budget. Accepted asynchronous sends must never reach here.
+func (c *Client) sendScheduledNow(ctx context.Context, job store.ScheduledMessage) SendResult {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	reject := func(kind string, delay time.Duration, reason string) SendResult {
+		return SendResult{BeforeNetwork: true, FailureKind: kind, RetryAfter: delay, Message: reason}
+	}
+	if ctx.Err() != nil {
+		return reject("offline", time.Minute, "send context cancelled")
+	}
+	jid, err := parseRecipient(job.ChatJID)
+	if err != nil {
+		return reject("", 0, err.Error())
+	}
+	sender := c.pairedSender()
+	if sender == "" || job.Sender != sender {
+		return reject("", 0, "scheduled authorization belongs to a different or unavailable sender")
+	}
+	known := c.IsKnownContact(jid)
+	if gate, temporary, next := c.sendSafety(known); gate != nil {
+		if temporary {
+			return reject("rate_limit", next.Sub(c.currentTime()), gate.Error())
+		}
+		return reject("", 0, gate.Error())
+	}
+
+	if !c.outboxConnected() {
+		return reject("offline", time.Minute, "transport disconnected")
+	}
+	if d, e := c.store.PersistentRecipientSendBudget(ctx, c.currentTime(), c.recipientBudgetKey(jid), known, false); e != nil {
+		return reject("", 0, e.Error())
+	} else if !d.Allowed {
+		return reject("rate_limit", d.RetryAfter, d.Reason)
+	}
+	msg := &waProto.Message{Conversation: proto.String(job.Text)}
+	if c.networkSend == nil {
+		msg.MessageContextInfo = c.ephemeralContextInfo(ctx, jid)
+		c.humanizeBeforeSend(ctx, jid, len(job.Text), false)
+	}
+	if c.pairedSender() != sender {
+		return reject("", 0, "paired sender changed before dispatch")
+	}
+	if ctx.Err() != nil || !c.outboxConnected() {
+		return reject("offline", time.Minute, "send context cancelled or disconnected")
+	}
+	if gate, temporary, next := c.sendSafety(known); gate != nil {
+		if temporary {
+			return reject("rate_limit", next.Sub(c.currentTime()), gate.Error())
+		}
+		return reject("", 0, gate.Error())
+	}
+	id := job.MessageID
+	if id == "" {
+		id = whatsmeow.GenerateMessageID()
+	}
+	if err = c.store.PrepareScheduledID(job.ID, id); err != nil {
+		return reject("", 0, err.Error())
+	}
+	d, e := c.reserveRecipientSend(ctx, c.recipientBudgetKey(jid), known)
+	if e != nil {
+		return reject("", 0, e.Error())
+	}
+	if !d.Allowed {
+		return reject("rate_limit", d.RetryAfter, d.Reason)
+	}
+	if ctx.Err() != nil {
+		return reject("offline", time.Minute, "send context cancelled before network boundary")
+	}
+	if hook, ok := ctx.Value(scheduledDispatchKey{}).(func() error); !ok {
+		return reject("", 0, "scheduled boundary hook absent")
+	} else if err = hook(); err != nil {
+		return reject("", 0, "scheduled dispatch state changed")
+	}
+	var resp whatsmeow.SendResponse
+	if c.networkSend != nil {
+		resp, err = c.networkSend(ctx, jid, msg, id)
+	} else {
+		resp, err = c.wa.SendMessage(ctx, jid, msg, whatsmeow.SendRequestExtra{ID: id})
+	}
+	if err != nil {
+		c.noteSendError(err)
+		if code, definite := definiteRefusalCode(err); definite {
+			if code == 429 || code == 463 || code == 475 {
+				if gate, temporary, _ := c.sendSafety(false); gate != nil && !temporary {
+					return SendResult{BeforeNetwork: true, Message: "definite refusal with account state requiring review"}
+				}
+				c.health.mu.Lock()
+				until := c.health.until
+				c.health.mu.Unlock()
+				if job.Attempts > 0 {
+					until = c.currentTime().Add(until.Sub(c.currentTime()) * time.Duration(job.Attempts+1))
+					c.setHealth(HealthRestricted, until, "repeated definite temporary server refusal", true)
+				}
+				return SendResult{FailureKind: "temporary_refusal", RetryAfter: until.Sub(c.currentTime())}
+			}
+			return SendResult{BeforeNetwork: true, Message: "server refused delivery"}
+		}
+		return SendResult{Message: "network outcome uncertain"}
+	}
+	c.noteSendOK()
+	if resp.ID != id {
+		return SendResult{Message: "unexpected network message ID"}
+	}
+	saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err = c.persistSent(saveCtx, jid, id, job.Text, "", msg); err != nil {
+		return SendResult{Success: true, ID: id, Message: fmt.Sprintf("delivered; outgoing cache failed: %v", err)}
+	}
+	return SendResult{Success: true, ID: id}
 }

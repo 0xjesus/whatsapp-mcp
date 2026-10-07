@@ -24,60 +24,64 @@ func (c *Client) StartEventHandler() {
 	if c.handlerInstalled {
 		return
 	}
-	c.handlerID = c.wa.AddEventHandler(func(evt interface{}) {
-		switch v := evt.(type) {
-		case *events.Message:
-			c.handleMessage(v)
-		case *events.HistorySync:
-			c.handleHistorySync(v)
-		case *events.Connected:
-			c.log.Infof("Connected to WhatsApp")
-			c.clearHealth("connected")
-			c.requestMonitoringRefresh()
-		case *events.GroupInfo:
-			c.invalidateMonitoringPolicy(v.JID.String())
-			c.requestMonitoringRefresh()
-		case *events.JoinedGroup:
-			c.invalidateMonitoringPolicy(v.JID.String())
-			c.requestMonitoringRefresh()
-		case *events.LoggedOut:
-			c.log.Warnf("Device logged out (reason %d, onConnect=%v), please scan QR code to log in again", v.Reason, v.OnConnect)
-			c.setHealth(HealthLoggedOut, time.Time{}, fmt.Sprintf("logged out by WhatsApp (reason %d)", v.Reason), true)
-		case *events.TemporaryBan:
-			c.log.Errorf("TEMPORARY BAN from WhatsApp: %v", v)
-			until := time.Time{}
-			if v.Expire > 0 {
-				until = time.Now().Add(v.Expire)
-			}
-			c.setHealth(HealthTempBanned, until, fmt.Sprintf("temporary ban: %v", v), true)
-		case *events.ConnectFailure:
-			c.log.Errorf("Connect failure %d: %s", v.Reason, v.Message)
-			if v.Reason == events.ConnectFailureTempBanned {
-				c.setHealth(HealthTempBanned, time.Now().Add(24*time.Hour), "connect refused: temporarily banned (402)", true)
-			}
-		case *events.ClientOutdated:
-			c.log.Errorf("WhatsApp says this client is OUTDATED: rebuild with a newer whatsmeow (make upgrade-check && make build)")
-			c.setHealth(HealthOutdated, time.Time{}, "client outdated (405): rebuild daemon with newer whatsmeow", true)
-		case *events.StreamError:
-			c.log.Warnf("Stream error from server: code=%s", v.Code)
-		case *events.KeepAliveTimeout:
-			c.log.Warnf("Keepalive timeout (%d in a row, last success %s)", v.ErrorCount, v.LastSuccess.Format(time.RFC3339))
-		case *events.StreamReplaced:
-			c.log.Errorf("Stream replaced: another client connected with this session. Only ONE daemon may use this store.")
-		case *events.OfflineSyncPreview:
-			c.log.Infof("Offline sync starting - %d messages, %d receipts pending", v.Messages, v.Receipts)
-		case *events.OfflineSyncCompleted:
-			c.log.Infof("Offline sync completed - %d messages synced", v.Count)
-		case *events.Receipt:
-			c.log.Debugf("Receipt for %d messages: %s", len(v.MessageIDs), v.Type)
-		case *events.UndecryptableMessage:
-			c.handleUnavailable(v)
-			c.log.Warnf("Undecryptable message from %s", v.Info.Sender)
-		default:
-			c.log.Debugf("Unhandled event type: %T", v)
-		}
-	})
+	c.handlerID = c.wa.AddEventHandler(c.handleEvent)
 	c.handlerInstalled = true
+}
+
+func (c *Client) handleEvent(evt interface{}) {
+	switch v := evt.(type) {
+	case *events.NotifyAccountReachoutTimelock:
+		c.handleNativeRestriction(v)
+	case *events.Message:
+		c.handleMessage(v)
+	case *events.HistorySync:
+		c.handleHistorySync(v)
+	case *events.Connected:
+		c.log.Infof("Connected to WhatsApp")
+		c.clearHealth("connected")
+		c.requestMonitoringRefresh()
+	case *events.GroupInfo:
+		c.invalidateMonitoringPolicy(v.JID.String())
+		c.requestMonitoringRefresh()
+	case *events.JoinedGroup:
+		c.invalidateMonitoringPolicy(v.JID.String())
+		c.requestMonitoringRefresh()
+	case *events.LoggedOut:
+		c.log.Warnf("Device logged out (reason %d, onConnect=%v), please scan QR code to log in again", v.Reason, v.OnConnect)
+		c.setHealth(HealthLoggedOut, time.Time{}, fmt.Sprintf("logged out by WhatsApp (reason %d)", v.Reason), true)
+	case *events.TemporaryBan:
+		c.log.Errorf("TEMPORARY BAN from WhatsApp: %v", v)
+		until := time.Time{}
+		if v.Expire > 0 {
+			until = time.Now().Add(v.Expire)
+		}
+		c.setHealth(HealthTempBanned, until, fmt.Sprintf("temporary ban: %v", v), true)
+	case *events.ConnectFailure:
+		c.log.Errorf("Connect failure %d: %s", v.Reason, v.Message)
+		if v.Reason == events.ConnectFailureTempBanned {
+			c.setHealth(HealthTempBanned, time.Now().Add(24*time.Hour), "connect refused: temporarily banned (402)", true)
+		}
+	case *events.ClientOutdated:
+		c.log.Errorf("WhatsApp says this client is OUTDATED: rebuild with a newer whatsmeow (make upgrade-check && make build)")
+		c.setHealth(HealthOutdated, time.Time{}, "client outdated (405): rebuild daemon with newer whatsmeow", true)
+	case *events.StreamError:
+		c.log.Warnf("Stream error from server: code=%s", v.Code)
+	case *events.KeepAliveTimeout:
+		c.log.Warnf("Keepalive timeout (%d in a row, last success %s)", v.ErrorCount, v.LastSuccess.Format(time.RFC3339))
+	case *events.StreamReplaced:
+		c.log.Errorf("Stream replaced: another client connected with this session. Only ONE daemon may use this store.")
+	case *events.OfflineSyncPreview:
+		c.log.Infof("Offline sync starting - %d messages, %d receipts pending", v.Messages, v.Receipts)
+	case *events.OfflineSyncCompleted:
+		c.log.Infof("Offline sync completed - %d messages synced", v.Count)
+	case *events.Receipt:
+		c.log.Debugf("Receipt for %d messages: %s", len(v.MessageIDs), v.Type)
+	case *events.UndecryptableMessage:
+		c.handleUnavailable(v)
+		c.log.Warnf("Undecryptable message from %s", v.Info.Sender)
+	default:
+		c.log.Debugf("Unhandled event type: %T", v)
+	}
 }
 
 // normalizedMessage holds the result of normalizeIncomingMessage: the

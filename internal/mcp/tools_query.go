@@ -267,9 +267,10 @@ func (s *Server) registerGetStatus() {
 		mcp.WithIdempotentHintAnnotation(true),
 		mcp.WithOpenWorldHintAnnotation(false),
 	)
-	s.mcp.AddTool(tool, func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	s.mcp.AddTool(tool, func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		status := map[string]any{
 			"connected": s.client.IsConnected(),
+			"outbox":    s.client.OutboxSnapshot(ctx),
 			"health":    s.client.HealthSnapshot(),
 		}
 		if wa := s.client.WA(); wa != nil && wa.Store != nil && wa.Store.ID != nil {
@@ -301,7 +302,7 @@ func (s *Server) registerPairingStatus() {
 		mcp.WithIdempotentHintAnnotation(true),
 		mcp.WithOpenWorldHintAnnotation(false),
 	)
-	s.mcp.AddTool(tool, func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	s.mcp.AddTool(tool, func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		var ownJID, ownPhone string
 		ready := false
 		// Short-circuits before touching s.client unless we are paired, so a

@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"errors"
+	"fmt"
 	"github.com/sealjay/mcp-whatsapp/internal/ratelimit"
 	"github.com/sealjay/mcp-whatsapp/internal/store"
 	"go.mau.fi/whatsmeow"
@@ -193,5 +194,29 @@ func TestMutationGateRechecksHealthAfterContactLookup(t *testing.T) {
 	}
 	if err := <-result; err == nil {
 		t.Fatal("contact lookup allowed a send after ban arrived")
+	}
+}
+
+func TestHealthRefusalClassifierRequiresLibraryContract(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		err     error
+		blocked bool
+	}{
+		{"ack", fmt.Errorf("%w %d", whatsmeow.ErrServerReturnedError, 402), true},
+		{"wrapped ack", fmt.Errorf("outer: %w", fmt.Errorf("%w %d", whatsmeow.ErrServerReturnedError, 402)), true},
+		{"typed IQ", fmt.Errorf("outer: %w", &whatsmeow.IQError{Code: 402}), true},
+		{"untrusted text", errors.New("server returned error 402"), false},
+		{"extra digits", fmt.Errorf("%w 1402", whatsmeow.ErrServerReturnedError), false},
+		{"extra suffix", fmt.Errorf("%w 402 timeout", whatsmeow.ErrServerReturnedError), false},
+		{"bare sentinel", whatsmeow.ErrServerReturnedError, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newDisconnectedClient()
+			c.noteSendError(tc.err)
+			if got := c.sendGate(true) != nil; got != tc.blocked {
+				t.Fatalf("blocked=%v want%v", got, tc.blocked)
+			}
+		})
 	}
 }

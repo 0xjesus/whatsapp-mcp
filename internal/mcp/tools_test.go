@@ -14,6 +14,8 @@ var expectedToolNames = []string{
 	"list_scheduled_messages",
 	"reschedule_message",
 	"schedule_message",
+	"get_outbox",
+	"cancel_outbox",
 	"create_group",
 	"delete_message",
 	"download_media",
@@ -125,7 +127,7 @@ func TestNewServer_RegistersAllTools(t *testing.T) {
 
 func TestNewServer_ToolCount(t *testing.T) {
 	s := NewServer(nil, nil)
-	const want = 51
+	const want = 53
 	if got := len(s.MCP().ListTools()); got != want {
 		t.Errorf("tool count = %d, want %d", got, want)
 	}

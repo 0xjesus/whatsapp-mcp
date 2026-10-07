@@ -15,6 +15,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"go.mau.fi/whatsmeow"
+	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/proto/waCompanionReg"
 	wmstore "go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -52,6 +53,8 @@ type Client struct {
 	redactor             *security.Redactor
 	limiter              *ratelimit.Limiter
 	health               health
+	nativeRestriction    nativeRestriction // guarded by health.mu
+	nativePersistErr     error             // independent of legacy health persistence
 	recoveryMu           sync.Mutex
 	monitoringStateMu    sync.Mutex
 	monitoringGeneration uint64
@@ -65,6 +68,16 @@ type Client struct {
 	lastRecovery         time.Time
 	scheduledSend        func(context.Context, string, string) SendResult
 	captureDownload      func(context.Context, string, string, string) DownloadResult
+	outboxWake           chan struct{}
+	outboxDone           chan struct{}
+	outboxOnce           sync.Once
+	senderIdentity       func() string // synthetic identity only in tests
+	clock                func() time.Time
+	uploadMedia          func(context.Context, []byte, whatsmeow.MediaType) (whatsmeow.UploadResponse, error)
+	preparationTimeout   time.Duration
+	networkSend          func(context.Context, types.JID, *waProto.Message, string) (whatsmeow.SendResponse, error)
+	healthPersistErr     error // guarded by health.mu; fails closed on disk errors
+	healthPersistent     bool
 	// Test seams for view-once recovery: connectivity check and the peer request send.
 	online      func() bool
 	peerRequest func(ctx context.Context, chat, participant types.JID, id string) (whatsmeow.SendResponse, error)
@@ -172,6 +185,9 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		allowedMediaRoot:  cfg.AllowedMediaRoot,
 		redactor:          redactor,
 		limiter:           limiter,
+	}
+	if err := c.initSendProtection(ctx); err != nil {
+		return nil, err
 	}
 	return c, nil
 }

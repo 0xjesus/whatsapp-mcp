@@ -93,29 +93,16 @@ func TestAnalyzeOggOpus_InvalidBytes(t *testing.T) {
 	}
 }
 
-func TestAnalyzeOggOpus_TruncatedHeader(t *testing.T) {
-	// "OggS" alone passes the initial 4-byte signature check but is too
-	// short for the 27-byte page header scan. Due to current implementation,
-	// the parse loop immediately breaks and duration falls back to the
-	// length-based estimate.
-	//
-	// The task spec asserts this should return an error; with the code as
-	// written it does not. Run the call to confirm behaviour.
-	dur, wf, err := AnalyzeOggOpus([]byte("OggS"))
-	if err != nil {
-		// Desired behaviour per spec: truncated header errors out.
-		return
+func TestAnalyzeOggOpus_TruncatedHeaderAndPayload(t *testing.T) {
+	truncatedPage := make([]byte, 28)
+	copy(truncatedPage, "OggS")
+	truncatedPage[26] = 1
+	truncatedPage[27] = 255
+	for _, data := range [][]byte{[]byte("OggS"), truncatedPage} {
+		if _, _, err := AnalyzeOggOpus(data); err == nil {
+			t.Fatalf("truncated Ogg accepted: %d bytes", len(data))
+		}
 	}
-	// Document actual behaviour: no error, returns clamped duration (>=1)
-	// and a 64-byte waveform. We flag this via t.Log so the test still
-	// passes against the current code, but the spec's expectation is noted.
-	if dur < 1 {
-		t.Fatalf("expected clamped duration >= 1, got %d", dur)
-	}
-	if len(wf) != 64 {
-		t.Fatalf("expected 64-byte waveform, got %d", len(wf))
-	}
-	t.Log("AnalyzeOggOpus did not return an error for truncated 'OggS' input; current implementation falls through to length-based duration estimate rather than erroring on short pages")
 }
 
 func TestAnalyzeOggOpus_ValidSynthetic(t *testing.T) {
