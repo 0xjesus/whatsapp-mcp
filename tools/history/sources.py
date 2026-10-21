@@ -8,6 +8,7 @@ not historical bodies. This makes retries and WhatsApp REPLACE writes harmless.
 """
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from itertools import islice
 from pathlib import Path
 import sqlite3
 import time
@@ -290,6 +291,31 @@ class Source:
                             (str(chat_id), str(message_id))).fetchone()
             return self._normalize(row) if row else None
 
+    def get_many(self, identities):
+        """Resolve one bounded page in order, with one read-only connection and a 5 s deadline."""
+        deadline = time.monotonic() + 5
+        keys = list(islice(identities, MAX_PAGE + 1))
+        if len(keys) > MAX_PAGE:
+            raise ValueError('source lookup page exceeds maximum size')
+        if not keys:
+            return []
+        with self._db() as c:
+            c.set_progress_handler(lambda: time.monotonic() > deadline, 10000)
+            alive = self._consent_filter(c) + (' AND COALESCE(m.deleted,0)=0' if self.kind == 'telegram' else '')
+            query = self._select(c) + f" WHERE m.{self.fields['chat']}=? AND m.id=?{alive}"
+            rows = []
+            for chat_id, message_id in keys:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise sqlite3.OperationalError('interrupted')
+                # Lock waits share the page deadline, rather than restarting 5 s per key.
+                c.execute('PRAGMA busy_timeout=' + str(int(remaining * 1000)))
+                row = c.execute(query, (str(chat_id), str(message_id))).fetchone()
+                rows.append(self._normalize(row) if row else None)
+            if time.monotonic() > deadline:
+                raise sqlite3.OperationalError('interrupted')
+            return rows
+
     def _install_group_rescan(self, c, chat_column, prefix):
         c.execute("""CREATE TABLE IF NOT EXISTS memory_group_rescan(
             chat_id TEXT PRIMARY KEY,cursor TEXT)""")
@@ -307,7 +333,8 @@ class Source:
                 c.execute(f"""CREATE TRIGGER {prefix}_delete AFTER DELETE ON group_monitoring_consent BEGIN
                     DELETE FROM memory_group_rescan WHERE chat_id=CAST(old.{chat_column} AS TEXT); END""")
                 continue
-            transition = '' if event == 'INSERT' else f' AND (old.allowed!=1 OR old.evidence IS NOT new.evidence OR {renewed})'
+            # New evidence alone must not rewind recovery while permission is still valid.
+            transition = '' if event == 'INSERT' else f' AND (old.allowed!=1 OR {renewed})'
             c.execute(f"""CREATE TRIGGER {prefix}_{event.lower()} AFTER {event} ON group_monitoring_consent
                 WHEN new.allowed=1 AND {fresh}{transition} BEGIN
                 INSERT INTO memory_group_rescan(chat_id,cursor) VALUES(CAST(new.{chat_column} AS TEXT),NULL)
@@ -328,7 +355,8 @@ class Source:
             return
         predicate = f'{column}=?'
         args = [peer]
-        if pending['cursor'] is not None:
+        # Older queues use an empty string for the initial keyset position.
+        if pending['cursor'] not in (None, ''):
             predicate += ' AND id>?'
             args.append(int(pending['cursor']) if self.kind == 'telegram' else pending['cursor'])
         rows = c.execute(f'SELECT id FROM messages WHERE {predicate} ORDER BY id LIMIT ?',

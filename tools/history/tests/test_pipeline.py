@@ -56,7 +56,7 @@ class PipelineTests(unittest.TestCase):
         from worker import ingest_step
         source=Mock(kind='telegram')
         source.changes.return_value=[dict(seq=11,chat_id='a',message_id='1',op='delete',event_token='new')]
-        source.get.return_value={'source':'telegram','chat_id':'a','message_id':'1','text':'recreated'}
+        source.get_many.return_value=[{'source':'telegram','chat_id':'a','message_id':'1','text':'recreated'}]
         store=Mock()
         store.state.return_value={'backfill_done':True,'cursor':10,'change_seq':10}
         self.assertTrue(ingest_step(store,source))
@@ -64,6 +64,43 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(store.apply.call_args.kwargs['change_token'],'new')
         self.assertEqual(store.apply.call_args.args[0][0]['text'],'recreated')
         self.assertEqual(store.apply.call_args.kwargs['deleted'],[])
+
+    def test_ingestion_reads_one_deduplicated_page_in_event_order(self):
+        from worker import ingest_step
+        source=Mock(kind='telegram')
+        source.changes.return_value=[dict(seq=seq,chat_id='a',message_id=key,event_token=str(seq))
+            for seq,key in [(11,'2'),(12,'1'),(13,'2'),(14,'gone')]]
+        rows=[dict(source='telegram',chat_id='a',message_id=key,text='synthetic') for key in ('2','1')]
+        source.get_many.return_value=rows+[None]
+        store=Mock()
+        store.state.return_value={'backfill_done':True,'cursor':10,'change_seq':10}
+        self.assertTrue(ingest_step(store,source))
+        source.get_many.assert_called_once_with([('a','2'),('a','1'),('a','gone')])
+        source.get.assert_not_called()
+        store.apply.assert_called_once_with(rows,'telegram',deleted=[('a','gone')],change_seq=14,change_token='14')
+
+    def test_source_page_error_never_applies_partial_data_or_checkpoint(self):
+        import sqlite3
+        from worker import ingest_step
+        source=Mock(kind='telegram')
+        source.changes.return_value=[dict(seq=11,chat_id='a',message_id='1',event_token='new')]
+        source.get_many.side_effect=sqlite3.OperationalError('interrupted')
+        store=Mock()
+        store.state.return_value={'backfill_done':True,'cursor':10,'change_seq':10}
+        with self.assertRaises(sqlite3.OperationalError):
+            ingest_step(store,source)
+        store.apply.assert_not_called()
+
+    def test_source_page_length_mismatch_cannot_advance_checkpoint(self):
+        from worker import ingest_step
+        source=Mock(kind='telegram')
+        source.changes.return_value=[dict(seq=11,chat_id='a',message_id='1',event_token='new')]
+        source.get_many.return_value=[]
+        store=Mock()
+        store.state.return_value={'backfill_done':True,'cursor':10,'change_seq':10}
+        with self.assertRaises(ValueError):
+            ingest_step(store,source)
+        store.apply.assert_not_called()
 
     def test_embedding_failure_does_not_publish_success(self):
         from worker import embedding_step
