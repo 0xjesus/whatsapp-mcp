@@ -131,7 +131,7 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 
 	dbLog := NewStderrLogger("Database", "INFO", true)
 	waPath := filepath.Join(cfg.StoreDir, "whatsapp.db")
-	container, err := sqlstore.New(ctx, "sqlite3", "file:"+waPath+"?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(ctx, "sqlite3", store.WhatsmeowDSN(waPath), dbLog)
 	if err != nil {
 		return nil, fmt.Errorf("open whatsmeow sqlstore: %w", err)
 	}
