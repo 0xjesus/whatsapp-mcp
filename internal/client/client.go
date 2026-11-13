@@ -44,6 +44,9 @@ type Config struct {
 
 // Client wraps a whatsmeow.Client together with the message cache and logger.
 type Client struct {
+	historyPeerSend      func(context.Context, types.JID, *types.MessageInfo) (whatsmeow.SendResponse, error)
+	historyOnce          sync.Once
+	historyDone          chan struct{}
 	wa                   *whatsmeow.Client
 	store                *store.Store
 	log                  waLog.Logger
@@ -75,6 +78,7 @@ type Client struct {
 	clock                func() time.Time
 	uploadMedia          func(context.Context, []byte, whatsmeow.MediaType) (whatsmeow.UploadResponse, error)
 	preparationTimeout   time.Duration
+	recipientLookup      func(context.Context, []string) ([]types.IsOnWhatsAppResponse, error)
 	networkSend          func(context.Context, types.JID, *waProto.Message, string) (whatsmeow.SendResponse, error)
 	healthPersistErr     error // guarded by health.mu; fails closed on disk errors
 	healthPersistent     bool

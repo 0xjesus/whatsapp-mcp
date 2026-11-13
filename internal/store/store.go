@@ -114,7 +114,7 @@ func Open(dir string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	if _, err := db.Exec(schema + schedulerSchema); err != nil {
+	if _, err := db.Exec(schema + schedulerSchema + historySchema + originalsSchema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
@@ -305,6 +305,7 @@ CREATE TABLE IF NOT EXISTS outbound_jobs (
  attempts INTEGER NOT NULL DEFAULT 0, reason TEXT NOT NULL DEFAULT '',
  sent_id TEXT NOT NULL DEFAULT '', sender TEXT NOT NULL DEFAULT '', idempotency_key TEXT NOT NULL DEFAULT '', request_hash TEXT NOT NULL DEFAULT '', payload TEXT NOT NULL, media BLOB
 );
+CREATE TABLE IF NOT EXISTS recipient_aliases (recipient TEXT PRIMARY KEY, canonical TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS outbound_protection (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS outbound_attempts (at_ns INTEGER NOT NULL, known INTEGER NOT NULL, recipient TEXT NOT NULL DEFAULT '');
 CREATE INDEX IF NOT EXISTS outbound_attempts_by_time ON outbound_attempts(at_ns);

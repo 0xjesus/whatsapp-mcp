@@ -17,6 +17,7 @@ func (s *Server) registerMessageTools() {
 	s.registerMarkRead()
 	s.registerMarkChatRead()
 	s.registerRequestSync()
+	s.registerHistoryCrawl()
 	s.registerDownloadMedia()
 }
 
@@ -142,9 +143,9 @@ type requestSyncArgs struct {
 
 func (s *Server) registerRequestSync() {
 	tool := mcp.NewTool("request_sync",
-		mcp.WithDescription("Ask WhatsApp servers to backfill historical messages for a chat into the local cache; messages arrive asynchronously and become queryable via list_messages once delivered. No effect on the chat itself or other users. If `from_timestamp` is omitted, the request anchors on the newest cached message. Returns a plain-text confirmation describing what was requested."),
+		mcp.WithDescription("Ask WhatsApp servers to backfill historical messages for a chat into the local cache; messages arrive asynchronously and become queryable via list_messages once delivered. No effect on the chat itself or other users. If `from_timestamp` is omitted, anchors on the oldest eligible real cached message; if supplied, selects an eligible real cached key at or before it. Requests 50 messages before that key. Missing anchors fail visibly. Enforces durable global 60-second pacing and one outstanding request. Submission does not prove upstream completeness."),
 		mcp.WithString("chat_jid", mcp.Description(jidDesc)),
-		mcp.WithString("from_timestamp", mcp.Description("ISO-8601 UTC timestamp marking the lower bound; if omitted, anchors on the newest cached message in the chat")),
+		mcp.WithString("from_timestamp", mcp.Description("ISO-8601 timestamp restricting eligible real cached anchors to at or before this time; omitted selects oldest real cached key")),
 		mcp.WithReadOnlyHintAnnotation(false),
 		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithIdempotentHintAnnotation(true),
@@ -152,7 +153,7 @@ func (s *Server) registerRequestSync() {
 	)
 	s.mcp.AddTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, a requestSyncArgs) (*mcp.CallToolResult, error) {
 		if a.ChatJID == "" {
-			return mcp.NewToolResultText("Provide chat_jid to sync. Optionally add from_timestamp (ISO-8601) to anchor on a specific time; omit to anchor on the newest cached message."), nil
+			return mcp.NewToolResultText("Provide chat_jid to sync. Optionally add from_timestamp (ISO-8601) to anchor on a specific time; omit to anchor on the oldest eligible real cached message."), nil
 		}
 		var ts time.Time
 		if a.FromTimestamp != "" {

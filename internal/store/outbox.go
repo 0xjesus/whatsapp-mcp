@@ -195,9 +195,12 @@ func (s *Store) confirmedOutgoing(ctx context.Context, id, recipient string) (bo
 	if id == "" {
 		return false, nil
 	}
-	canonical := s.ResolveLIDToJID(recipient)
+	canonical, err := s.RecipientAlias(ctx, s.ResolveLIDToJID(recipient))
+	if err != nil {
+		return false, err
+	}
 	var n int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages WHERE id=? AND is_from_me=1 AND chat_jid IN (?,?)`, id, recipient, canonical).Scan(&n)
+	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages WHERE id=? AND is_from_me=1 AND chat_jid IN (?,?)`, id, recipient, canonical).Scan(&n)
 	return n > 0, err
 }
 

@@ -118,7 +118,19 @@ func (c *Client) RequestViewOnceRecovery(ctx context.Context, chat, id string) (
 	requestJID, participant := jid, jid
 	if isGroup {
 		if errors.Is(err, sql.ErrNoRows) || r.SenderJID == "" {
-			return zero, fmt.Errorf("group recovery needs the original sender; nothing recorded for this message")
+			// Any stored group message can be asked for again (for instance one
+			// whose text an older parser lost): its row names the sender.
+			sender, serr := c.store.MessageSender(normalized, id)
+			if serr != nil || sender == "" {
+				return zero, fmt.Errorf("group recovery needs the original sender; nothing recorded for this message")
+			}
+			if !strings.Contains(sender, "@") {
+				sender += "@" + types.DefaultUserServer
+			}
+			r = store.ViewOnce{MessageID: id, ChatJID: normalized, SenderJID: sender, State: "unavailable"}
+			if err = c.store.PutViewOnce(ctx, r); err != nil {
+				return zero, err
+			}
 		}
 		if participant, err = types.ParseJID(r.SenderJID); err != nil {
 			return zero, fmt.Errorf("stored sender_jid is invalid: %w", err)

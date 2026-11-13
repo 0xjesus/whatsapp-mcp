@@ -307,6 +307,20 @@ func (c *Client) processOutbox(ctx context.Context) {
 		err = c.store.UpdateOutbox(ctx, j.JobID, "queued", "local pacing: "+d.Reason, "", now.Add(d.RetryAfter))
 		return
 	}
+	resolveCtx, resolveCancel := context.WithTimeout(ctx, 30*time.Second)
+	resolved, resolveErr := c.resolveSendRecipient(resolveCtx, jid)
+	resolveCancel()
+	if resolveErr != nil {
+		state, next := "queued", c.currentTime().Add(time.Minute)
+		if errors.Is(resolveErr, errRecipientNotRegistered) {
+			state = "failed"
+		}
+		err = c.store.UpdateOutbox(ctx, j.JobID, state, "recipient resolution failed before dispatch: "+resolveErr.Error(), "", next)
+		return
+	}
+	jid = resolved
+	// Never upgrade the public-number classification to a looser contact limit.
+	known = known && c.IsKnownContact(jid)
 	j.Payload, j.Media, err = c.store.LoadOutboxPayload(ctx, j.JobID)
 	if err != nil {
 		return

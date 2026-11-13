@@ -32,6 +32,13 @@ func (s *Store) PersistentRecipientSendBudget(ctx context.Context, now time.Time
 	if _, err = tx.ExecContext(ctx, `UPDATE outbound_protection SET value=value WHERE key='initial_guard'`); err != nil {
 		return ratelimit.Decision{}, err
 	}
+	var canonical string
+	aliasErr := tx.QueryRowContext(ctx, `SELECT canonical FROM recipient_aliases WHERE recipient=?`, recipient).Scan(&canonical)
+	if aliasErr == nil {
+		recipient = canonical
+	} else if !errors.Is(aliasErr, sql.ErrNoRows) {
+		return ratelimit.Decision{}, aliasErr
+	}
 	var guard int64
 	err = tx.QueryRowContext(ctx, `SELECT value FROM outbound_protection WHERE key='initial_guard'`).Scan(&guard)
 	if errors.Is(err, sql.ErrNoRows) {

@@ -29,6 +29,8 @@ var expectedToolNames = []string{
 	"get_privacy_settings",
 	"get_status",
 	"history_analytics",
+	"history_crawl_status",
+	"configure_history_crawl",
 	"index_status",
 	"is_on_whatsapp",
 	"join_group_with_link",
@@ -41,6 +43,7 @@ var expectedToolNames = []string{
 	"pairing_status",
 	"request_sync",
 	"request_view_once_recovery",
+	"request_message_resend",
 	"search_contacts",
 	"semantic_search",
 	"send_audio_message",
@@ -127,7 +130,7 @@ func TestNewServer_RegistersAllTools(t *testing.T) {
 
 func TestNewServer_ToolCount(t *testing.T) {
 	s := NewServer(nil, nil)
-	const want = 53
+	const want = 56
 	if got := len(s.MCP().ListTools()); got != want {
 		t.Errorf("tool count = %d, want %d", got, want)
 	}

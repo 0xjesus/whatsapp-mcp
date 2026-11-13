@@ -106,7 +106,8 @@ func runServe(storeDir string, redactor *security.Redactor, args []string) int {
 		fmt.Fprintf(os.Stderr, "start outbox: %v\n", err)
 		return 1
 	}
-	defer func() { cancel(); c.WaitOutbox() }()
+	c.StartHistoryCrawl(ctx)
+	defer func() { cancel(); c.WaitHistoryCrawl(); c.WaitOutbox() }()
 	drv := newProductionDriver(c)
 
 	// The daemon owns the pair cache, so build it first, then hand the cache

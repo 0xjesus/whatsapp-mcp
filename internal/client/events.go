@@ -3,8 +3,12 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"google.golang.org/protobuf/proto"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,6 +30,14 @@ func (c *Client) StartEventHandler() {
 	}
 	c.handlerID = c.wa.AddEventHandler(c.handleEvent)
 	c.handlerInstalled = true
+	go func() {
+		n, err := c.RepairFromOriginals(context.Background())
+		if err != nil {
+			c.log.Warnf("Re-reading kept originals stopped after %d: %v", n, err)
+		} else if n > 0 {
+			c.log.Infof("Re-read %d kept originals with parser v%d", n, ParserVersion)
+		}
+	}()
 }
 
 func (c *Client) handleEvent(evt interface{}) {
@@ -143,8 +155,9 @@ func (c *Client) normalizeIncomingMessage(
 		sender = ownID
 	}
 
-	content := extractTextContent(raw)
-	mediaType, filename, url, directPath, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(raw)
+	body := unwrapContent(raw)
+	content := extractTextContent(body)
+	mediaType, filename, url, directPath, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(body)
 
 	return normalizedMessage{
 		msg: store.Message{
@@ -262,6 +275,7 @@ func (c *Client) handleMessage(msg *events.Message) {
 		return
 	}
 
+	c.keepOriginal(context.Background(), msg.Info.ID, nm.chatJID, msg.Message)
 	c.captureViewOnce(msg, nm.chatJID)
 
 	direction := "<-"
@@ -278,6 +292,9 @@ func (c *Client) handleMessage(msg *events.Message) {
 
 // handleHistorySync processes a bulk history payload from WhatsApp.
 func (c *Client) handleHistorySync(historySync *events.HistorySync) {
+	if historySync == nil || historySync.Data == nil {
+		return
+	}
 	syncType := "UNKNOWN"
 	if historySync.Data.SyncType != nil {
 		syncType = historySync.Data.SyncType.String()
@@ -289,15 +306,45 @@ func (c *Client) handleHistorySync(historySync *events.HistorySync) {
 	syncedCount := 0
 
 	ownID := ""
-	if c.wa.Store.ID != nil {
+	if c.wa != nil && c.wa.Store != nil && c.wa.Store.ID != nil {
 		ownID = c.wa.Store.ID.User
 	}
 
 	for _, conversation := range historySync.Data.Conversations {
-		if conversation.ID == nil {
+		if conversation == nil || conversation.ID == nil {
 			continue
 		}
 		rawChatJID := *conversation.ID
+		observationChat := c.store.ResolveLIDToJID(rawChatJID)
+		wire, marshalErr := proto.Marshal(conversation)
+		if marshalErr != nil {
+			continue
+		}
+		digest := sha256.Sum256(wire)
+		var terminal *int
+		if conversation.EndOfHistoryTransferType != nil {
+			v := int(*conversation.EndOfHistoryTransferType)
+			terminal = &v
+		}
+		observationID, observationErr := c.store.BeginHistoryObservation(store.HistoryObservation{
+			ChatJID: observationChat, SyncType: syncType, Digest: hex.EncodeToString(digest[:]),
+			End: conversation.EndOfHistoryTransfer, TerminalType: terminal,
+			ChunkOrder: historySync.Data.ChunkOrder, Progress: historySync.Data.Progress,
+		}, c.currentTime())
+		if observationErr != nil {
+			c.log.Errorf("History ledger unavailable; originals still captured, coverage incomplete")
+			observationID = 0
+			_ = c.store.HoldHistoryCrawl(observationChat, "incomplete_ledger", c.currentTime())
+		}
+		pageStored, pageFailed := 0, 1
+		defer func() {
+			if observationID <= 0 {
+				return
+			}
+			if err := c.store.FinishHistoryObservation(observationID, pageStored, pageFailed, c.currentTime()); err != nil {
+				c.log.Errorf("History observation finalization failed; coverage incomplete")
+			}
+		}()
 		if !c.store.MonitoringAllowed(rawChatJID) {
 			continue
 		}
@@ -321,39 +368,48 @@ func (c *Client) handleHistorySync(historySync *events.HistorySync) {
 			}
 		}
 
-		name := c.GetChatName(jid, chatJID, conversation, "")
-
+		pageFailed = 0
 		messages := conversation.Messages
 		if len(messages) == 0 {
 			continue
 		}
 
+		name := c.GetChatName(jid, chatJID, conversation, "")
 		latestMsg := messages[0]
 		if latestMsg == nil || latestMsg.Message == nil {
+			pageFailed++
 			continue
 		}
 		ts := latestMsg.Message.GetMessageTimestamp()
 		if ts == 0 {
+			pageFailed++
 			continue
 		}
-		_ = c.store.StoreChat(chatJID, name, time.Unix(int64(ts), 0))
+		if err := c.store.StoreChat(chatJID, name, time.Unix(int64(ts), 0)); err != nil {
+			pageFailed++
+			continue
+		}
 
 		for _, msg := range messages {
 			if !c.store.MonitoringAllowed(chatJID) {
+				pageFailed++
 				break
 			}
 			if msg == nil || msg.Message == nil {
+				pageFailed++
 				continue
 			}
 
 			msgTS := msg.Message.GetMessageTimestamp()
-			if msgTS == 0 {
+			if msgTS == 0 || msg.Message.Key == nil || msg.Message.Key.GetID() == "" {
+				pageFailed++
 				continue
 			}
 			timestamp := time.Unix(int64(msgTS), 0)
 			unwrapped := (&events.Message{RawMessage: msg.Message.Message}).UnwrapRaw()
 			raw := unwrapped.Message
 			if c.applyIncomingMutation(chatJID, raw, timestamp) {
+				pageFailed++ // mutation API lacks durable success result
 				continue
 			}
 
@@ -394,6 +450,7 @@ func (c *Client) handleHistorySync(historySync *events.HistorySync) {
 			if nm.msg.Content == "" && nm.msg.MediaType == "" {
 				kind, signalOnly := unsupportedKind(raw)
 				if kind == "" || signalOnly {
+					pageFailed++ // cannot claim complete capture of skipped records
 					continue
 				}
 				c.log.Warnf("Unsupported history message kind %q from %s; stored as placeholder", kind, c.redactor.JID(nm.msg.Sender))
@@ -409,15 +466,18 @@ func (c *Client) handleHistorySync(historySync *events.HistorySync) {
 			nm.msg.ChatJID = chatJID
 
 			if err := c.store.StoreMessage(ctx, nm.msg, nm.mediaKey, nm.fileSHA256, nm.fileEncSHA256, nm.fileLength); err != nil {
-				c.log.Warnf("Failed to store history message: %v", err)
+				pageFailed++
+				c.log.Warnf("Failed to store history message; coverage incomplete")
 				continue
 			}
+			c.keepOriginal(ctx, msgID, chatJID, raw)
 			unwrapped.Info = types.MessageInfo{MessageSource: types.MessageSource{Chat: jid, Sender: jid, IsFromMe: isFromMe}, ID: msgID, Timestamp: timestamp}
 			c.captureViewOnce(unwrapped, chatJID)
 			if reactions := msg.Message.GetReactions(); len(reactions) > 0 {
 				c.applyHistoryReactions(ctx, chatJID, msgID, ownID, reactions)
 			}
 			syncedCount++
+			pageStored++
 			if nm.msg.MediaType != "" {
 				c.log.Infof("Stored message: [%s] %s -> %s: [%s: %s] %s",
 					timestamp.Format("2006-01-02 15:04:05"), c.redactor.JID(nm.msg.Sender), c.redactor.JID(chatJID), nm.msg.MediaType, nm.msg.Filename, c.redactor.Body(nm.msg.Content))
@@ -428,7 +488,7 @@ func (c *Client) handleHistorySync(historySync *events.HistorySync) {
 		}
 	}
 
-	c.log.Infof("History sync complete. Stored %d messages.", syncedCount)
+	c.log.Infof("History payload processed. Stored %d messages; upstream completeness unproven.", syncedCount)
 }
 
 // GetChatName determines the appropriate name for a chat. It checks the
@@ -502,6 +562,26 @@ func extractTextContent(msg *waProto.Message) string {
 	}
 	if ext := msg.GetExtendedTextMessage(); ext != nil {
 		return ext.GetText()
+	}
+	if al := msg.GetAlbumMessage(); al != nil {
+		return "[álbum] " + strconv.Itoa(int(al.GetExpectedImageCount())) + " fotos, " + strconv.Itoa(int(al.GetExpectedVideoCount())) + " videos"
+	}
+	// A message inside an album arrives wrapped; its text is the inner one's.
+	if child := msg.GetAssociatedChildMessage(); child != nil {
+		return extractTextContent(child.GetMessage())
+	}
+	// The text written with a photo, video or document is its caption.
+	if img := msg.GetImageMessage(); img != nil {
+		return img.GetCaption()
+	}
+	if vid := msg.GetVideoMessage(); vid != nil {
+		return vid.GetCaption()
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil {
+		return doc.GetCaption()
+	}
+	if dwc := msg.GetDocumentWithCaptionMessage(); dwc != nil {
+		return extractTextContent(dwc.GetMessage())
 	}
 	if st := msg.GetStickerMessage(); st != nil && st.GetIsAnimated() {
 		return "[sticker animado]"
